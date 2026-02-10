@@ -1,0 +1,2511 @@
+"use client";
+
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  MouseEvent,
+  WheelEvent,
+} from "react";
+import html2canvas from "html2canvas";
+import JSZip from "jszip";
+
+type Tool =
+  | "select"
+  | "pan"
+  | "connect"
+  | "category"
+  | "note"
+  | "text"
+  | "table"
+  | "image";
+
+type NodeType = "category" | "note" | "text" | "table" | "image";
+
+type StrategyLevel = "L1" | "L2" | "L3" | "Info";
+
+interface BaseNode {
+  id: string;
+  type: NodeType;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  text?: string;
+  bgColor?: string;
+  fontSize?: number;
+  owner?: string;
+  level?: StrategyLevel;
+  categoryTag?: string;
+  impact?: number;
+  effort?: number;
+}
+
+interface TableNode extends BaseNode {
+  type: "table";
+  rows: number;
+  cols: number;
+  cells: string[][];
+}
+
+interface ImageNode extends BaseNode {
+  type: "image";
+  imageDataUrl: string;
+}
+
+type Node = BaseNode | TableNode | ImageNode;
+
+interface Edge {
+  id: string;
+  fromId: string;
+  toId: string;
+}
+
+interface Viewport {
+  x: number;
+  y: number;
+  scale: number;
+}
+
+interface BoardState {
+  nodes: Node[];
+  edges: Edge[];
+  viewport: Viewport;
+  projectName?: string;
+}
+
+/** 多頁專案 */
+interface Page {
+  id: string;
+  name: string;
+  nodes: Node[];
+  edges: Edge[];
+  viewport: Viewport;
+}
+
+interface ProjectFileV2 {
+  version: 2;
+  projectName: string;
+  activePageId: string | null;
+  pages: Page[];
+}
+
+type ResizeHandle =
+  | "top-left"
+  | "top"
+  | "top-right"
+  | "right"
+  | "bottom-right"
+  | "bottom"
+  | "bottom-left"
+  | "left"
+  | null;
+
+type SelectionMode = "replace" | "add" | "subtract";
+
+function createId() {
+  return Math.random().toString(36).slice(2);
+}
+
+/** 左側模板（可以改成你原本的內容） */
+const templateNodes: Node[] = [
+  {
+    id: "tpl-ai",
+    type: "category",
+    x: 100,
+    y: 80,
+    width: 260,
+    height: 120,
+    text: "AI 核心技術",
+    bgColor: "#e0f2fe",
+    fontSize: 14,
+    level: "L1",
+    categoryTag: "技術",
+  },
+  {
+    id: "tpl-device",
+    type: "category",
+    x: 100,
+    y: 220,
+    width: 260,
+    height: 120,
+    text: "裝置 / Edge Device",
+    bgColor: "#dcfce7",
+    fontSize: 14,
+    level: "L1",
+    categoryTag: "裝置",
+  },
+  {
+    id: "tpl-cloud",
+    type: "category",
+    x: 100,
+    y: 360,
+    width: 260,
+    height: 120,
+    text: "雲端平台 / 生態系",
+    bgColor: "#ede9fe",
+    fontSize: 14,
+    level: "L2",
+    categoryTag: "平台",
+  },
+];
+
+const TEMPLATE_PANEL_WIDTH = 200;
+const OUTLINE_PANEL_WIDTH = 240;
+const RIGHT_PANEL_WIDTH = 320;
+
+const defaultViewport: Viewport = { x: -200, y: -200, scale: 1 };
+
+const defaultPage: Page = {
+  id: "page-1",
+  name: "Page 1",
+  nodes: [],
+  edges: [],
+  viewport: defaultViewport,
+};
+
+const STORAGE_KEY = "strategy_whiteboard_v2";
+
+/** 啟動時從 localStorage 載入 */
+function loadInitialState(): {
+  projectName: string;
+  pages: Page[];
+  activePageId: string | null;
+} {
+  if (typeof window === "undefined") {
+    return {
+      projectName: "未命名專案",
+      pages: [defaultPage],
+      activePageId: defaultPage.id,
+    };
+  }
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return {
+        projectName: "未命名專案",
+        pages: [defaultPage],
+        activePageId: defaultPage.id,
+      };
+    }
+    const parsed = JSON.parse(raw) as ProjectFileV2;
+    if (parsed.version === 2 && parsed.pages?.length) {
+      return {
+        projectName: parsed.projectName || "未命名專案",
+        pages: parsed.pages,
+        activePageId: parsed.activePageId || parsed.pages[0].id,
+      };
+    }
+  } catch (err) {
+    console.error("Failed to load from localStorage", err);
+  }
+  return {
+    projectName: "未命名專案",
+    pages: [defaultPage],
+    activePageId: defaultPage.id,
+  };
+}
+
+interface DragState {
+  offsetX: number;
+  offsetY: number;
+  nodeId: string;
+  isDragging: boolean;
+}
+
+interface ResizeState {
+  nodeId: string | null;
+  handle: ResizeHandle;
+  startX: number;
+  startY: number;
+  startWidth: number;
+  startHeight: number;
+}
+
+interface PanState {
+  isPanning: boolean;
+  startX: number;
+  startY: number;
+  startViewportX: number;
+  startViewportY: number;
+}
+
+interface CanvasSelectionState {
+  isSelecting: boolean;
+  startX: number;
+  startY: number;
+}
+
+export default function WhiteboardApp() {
+  const {
+    projectName: initialProjectName,
+    pages: initialPages,
+    activePageId: initialActivePageId,
+  } = loadInitialState();
+
+  const [projectName, setProjectName] = useState(initialProjectName);
+  const [pages, setPages] = useState<Page[]>(initialPages);
+  const [activePageId, setActivePageId] = useState<string | null>(
+    initialActivePageId
+  );
+
+  const [tool, setTool] = useState<Tool>("select");
+  const [viewport, setViewport] = useState<Viewport>(() => {
+    const page = initialPages.find((p) => p.id === initialActivePageId);
+    return page?.viewport || defaultViewport;
+  });
+  const [nodes, setNodes] = useState<Node[]>(() => {
+    const page = initialPages.find((p) => p.id === initialActivePageId);
+    return page?.nodes || [];
+  });
+  const [edges, setEdges] = useState<Edge[]>(() => {
+    const page = initialPages.find((p) => p.id === initialActivePageId);
+    return page?.edges || [];
+  });
+
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [primaryId, setPrimaryId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const [dragState, setDragState] = useState<DragState | null>(null);
+  const [resizeState, setResizeState] = useState<ResizeState>({
+    nodeId: null,
+    handle: null,
+    startX: 0,
+    startY: 0,
+    startWidth: 0,
+    startHeight: 0,
+  });
+  const [panState, setPanState] = useState<PanState>({
+    isPanning: false,
+    startX: 0,
+    startY: 0,
+    startViewportX: 0,
+    startViewportY: 0,
+  });
+  const [canvasSelection, setCanvasSelection] =
+    useState<CanvasSelectionState | null>(null);
+  const [selectionRect, setSelectionRect] = useState<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  } | null>(null);
+
+  const [connectingFrom, setConnectingFrom] = useState<string | null>(null);
+
+  const [formatPainterActive, setFormatPainterActive] = useState(false);
+  const [copiedStyle, setCopiedStyle] = useState<
+    | {
+        bgColor?: string;
+        fontSize?: number;
+        owner?: string;
+        level?: StrategyLevel;
+        categoryTag?: string;
+      }
+    | null
+  >(null);
+
+  const [clipboardNodes, setClipboardNodes] = useState<Node[] | null>(null);
+  const [clipboardEdges, setClipboardEdges] = useState<Edge[] | null>(null);
+
+  const [history, setHistory] = useState<BoardState[]>([]);
+  const [future, setFuture] = useState<BoardState[]>([]);
+
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isOutlineOpen, setIsOutlineOpen] = useState(true);
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState(true);
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+
+  const isDraggingRef = useRef(false);
+  const isResizingRef = useRef(false);
+  const isPanningRef = useRef(false);
+
+  const [selectionMode, setSelectionMode] =
+    useState<SelectionMode>("replace");
+  const selectionModeRef = useRef<SelectionMode>("replace");
+
+  useEffect(() => {
+    selectionModeRef.current = selectionMode;
+  }, [selectionMode]);
+
+  /** 每次狀態變更就存回 localStorage（包含多頁） */
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const data: ProjectFileV2 = {
+      version: 2,
+      projectName,
+      activePageId,
+      pages: pages.map((p) =>
+        p.id === activePageId
+          ? { ...p, nodes, edges, viewport }
+          : { ...p }
+      ),
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }, [pages, projectName, activePageId, nodes, edges, viewport]);
+
+  const recordHistory = () => {
+    setHistory((prev) => [
+      ...prev,
+      {
+        nodes: JSON.parse(JSON.stringify(nodes)),
+        edges: JSON.parse(JSON.stringify(edges)),
+        viewport: { ...viewport },
+        projectName,
+      },
+    ]);
+    setFuture([]);
+  };
+
+  const undo = () => {
+    setHistory((prev) => {
+      if (!prev.length) return prev;
+      const last = prev[prev.length - 1];
+      setFuture((f) => [
+        {
+          nodes: JSON.parse(JSON.stringify(nodes)),
+          edges: JSON.parse(JSON.stringify(edges)),
+          viewport: { ...viewport },
+          projectName,
+        },
+        ...f,
+      ]);
+      setNodes(last.nodes);
+      setEdges(last.edges);
+      setViewport(last.viewport);
+      setProjectName(last.projectName ?? projectName);
+      return prev.slice(0, -1);
+    });
+  };
+
+  const redo = () => {
+    setFuture((prev) => {
+      if (!prev.length) return prev;
+      const next = prev[0];
+      setHistory((h) => [
+        ...h,
+        {
+          nodes: JSON.parse(JSON.stringify(nodes)),
+          edges: JSON.parse(JSON.stringify(edges)),
+          viewport: { ...viewport },
+          projectName,
+        },
+      ]);
+      setNodes(next.nodes);
+      setEdges(next.edges);
+      setViewport(next.viewport);
+      setProjectName(next.projectName ?? projectName);
+      return prev.slice(1);
+    });
+  };
+
+  const handleNodeMouseDown = (
+    e: MouseEvent<HTMLDivElement>,
+    node: Node
+  ) => {
+    e.stopPropagation();
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    const offsetX = worldX - node.x;
+    const offsetY = worldY - node.y;
+
+    const isMultiSelect =
+      e.shiftKey || e.metaKey || e.ctrlKey || selectionMode !== "replace";
+
+    let newSelectedIds = selectedIds;
+    if (isMultiSelect) {
+      if (!selectedIds.includes(node.id)) {
+        newSelectedIds = [...selectedIds, node.id];
+      } else if (selectionMode === "subtract") {
+        newSelectedIds = selectedIds.filter((id) => id !== node.id);
+      }
+    } else {
+      if (!selectedIds.includes(node.id)) {
+        newSelectedIds = [node.id];
+      }
+    }
+    setSelectedIds(newSelectedIds);
+    setPrimaryId(node.id);
+    setEditingId(null);
+
+    let pivotNode = node;
+    if (newSelectedIds.length > 1) {
+      const currentIndex = newSelectedIds.indexOf(node.id);
+      const nextIndex =
+        (currentIndex + 1 + newSelectedIds.length) % newSelectedIds.length;
+      const nextId = newSelectedIds[nextIndex];
+      const maybeNode = nodes.find((n) => n.id === nextId);
+      if (maybeNode) {
+        pivotNode = maybeNode;
+      }
+    }
+
+    const pivotOffsetX = worldX - pivotNode.x;
+    const pivotOffsetY = worldY - pivotNode.y;
+
+    setDragState({
+      offsetX: pivotOffsetX,
+      offsetY: pivotOffsetY,
+      nodeId: pivotNode.id,
+      isDragging: true,
+    });
+    isDraggingRef.current = true;
+  };
+
+  const handleCanvasMouseDown = (e: MouseEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    if (tool === "pan" || e.button === 1) {
+      setPanState({
+        isPanning: true,
+        startX: e.clientX,
+        startY: e.clientY,
+        startViewportX: viewport.x,
+        startViewportY: viewport.y,
+      });
+      isPanningRef.current = true;
+      return;
+    }
+
+    recordHistory();
+    setCanvasSelection({
+      isSelecting: true,
+      startX: worldX,
+      startY: worldY,
+    });
+    setSelectionRect({
+      x: worldX,
+      y: worldY,
+      w: 0,
+      h: 0,
+    });
+
+    if (selectionMode === "replace") {
+      setSelectedIds([]);
+      setPrimaryId(null);
+      setEditingId(null);
+    }
+  };
+
+  const handleCanvasMouseMove = (e: MouseEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    if (isDraggingRef.current && dragState?.isDragging) {
+      const pivot = nodes.find((n) => n.id === dragState.nodeId);
+      if (!pivot) return;
+      const dxPivot = worldX - dragState.offsetX - pivot.x;
+      const dyPivot = worldY - dragState.offsetY - pivot.y;
+
+      setNodes((prev) =>
+        prev.map((node) =>
+          selectedIds.includes(node.id)
+            ? { ...node, x: node.x + dxPivot, y: node.y + dyPivot }
+            : node
+        )
+      );
+      return;
+    }
+
+    if (isResizingRef.current && resizeState.nodeId && resizeState.handle) {
+      const dx =
+        (e.clientX - rect.left) / viewport.scale - resizeState.startX;
+      const dy =
+        (e.clientY - rect.top) / viewport.scale - resizeState.startY;
+
+      setNodes((prev) =>
+        prev.map((node) => {
+          if (node.id !== resizeState.nodeId) return node;
+
+          let { x, y, width, height } = node;
+          let newX = x;
+          let newY = y;
+          let newWidth = width;
+          let newHeight = height;
+          const minSize = 40;
+
+          if (
+            resizeState.handle === "top-left" ||
+            resizeState.handle === "top" ||
+            resizeState.handle === "top-right"
+          ) {
+            newHeight = Math.max(minSize, resizeState.startHeight - dy);
+            newY = y + (height - newHeight);
+          }
+          if (
+            resizeState.handle === "bottom-left" ||
+            resizeState.handle === "bottom" ||
+            resizeState.handle === "bottom-right"
+          ) {
+            newHeight = Math.max(minSize, resizeState.startHeight + dy);
+          }
+          if (
+            resizeState.handle === "top-left" ||
+            resizeState.handle === "left" ||
+            resizeState.handle === "bottom-left"
+          ) {
+            newWidth = Math.max(minSize, resizeState.startWidth - dx);
+            newX = x + (width - newWidth);
+          }
+          if (
+            resizeState.handle === "top-right" ||
+            resizeState.handle === "right" ||
+            resizeState.handle === "bottom-right"
+          ) {
+            newWidth = Math.max(minSize, resizeState.startWidth + dx);
+          }
+
+          return {
+            ...node,
+            x: newX,
+            y: newY,
+            width: newWidth,
+            height: newHeight,
+          };
+        })
+      );
+      return;
+    }
+
+    if (isPanningRef.current && panState.isPanning) {
+      const dx = e.clientX - panState.startX;
+      const dy = e.clientY - panState.startY;
+      setViewport((v) => ({
+        ...v,
+        x: panState.startViewportX + dx,
+        y: panState.startViewportY + dy,
+      }));
+      return;
+    }
+
+    if (canvasSelection?.isSelecting && selectionRect) {
+      const sx = Math.min(canvasSelection.startX, worldX);
+      const sy = Math.min(canvasSelection.startY, worldY);
+      const sw = Math.abs(worldX - canvasSelection.startX);
+      const sh = Math.abs(worldY - canvasSelection.startY);
+
+      setSelectionRect({
+        x: sx,
+        y: sy,
+        w: sw,
+        h: sh,
+      });
+    }
+  };
+
+  const handleCanvasMouseUp = () => {
+    if (canvasSelection?.isSelecting && selectionRect) {
+      const { x, y, w, h } = selectionRect;
+      const includedIds = nodes
+        .filter(
+          (node) =>
+            node.x + node.width >= x &&
+            node.x <= x + w &&
+            node.y + node.height >= y &&
+            node.y <= y + h
+        )
+        .map((node) => node.id);
+
+      let newSelected: string[] = [];
+      if (selectionModeRef.current === "add") {
+        const set = new Set([...selectedIds, ...includedIds]);
+        newSelected = Array.from(set);
+      } else if (selectionModeRef.current === "subtract") {
+        const set = new Set(selectedIds);
+        includedIds.forEach((id) => set.delete(id));
+        newSelected = Array.from(set);
+      } else {
+        newSelected = includedIds;
+      }
+
+      setSelectedIds(newSelected);
+      setPrimaryId(newSelected[0] || null);
+      setSelectionRect(null);
+    }
+
+    isDraggingRef.current = false;
+    isResizingRef.current = false;
+    isPanningRef.current = false;
+    setDragState(null);
+    setResizeState({
+      nodeId: null,
+      handle: null,
+      startX: 0,
+      startY: 0,
+      startWidth: 0,
+      startHeight: 0,
+    });
+    setPanState({
+      isPanning: false,
+      startX: 0,
+      startY: 0,
+      startViewportX: 0,
+      startViewportY: 0,
+    });
+    setCanvasSelection(null);
+  };
+
+  const handleWheel = (e: WheelEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = containerRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const delta = -e.deltaY;
+    const zoomFactor = delta > 0 ? 1.1 : 1 / 1.1;
+
+    setViewport((v) => {
+      const newScale = Math.min(3, Math.max(0.2, v.scale * zoomFactor));
+      const worldX = (mx - v.x) / v.scale;
+      const worldY = (my - v.y) / v.scale;
+      const newX = mx - worldX * newScale;
+      const newY = my - worldY * newScale;
+      return { x: newX, y: newY, scale: newScale };
+    });
+  };
+
+  /** Mini-map 上的 slider 直接改變縮放（以畫布中心為基準） */
+  const handleZoomSliderChange = (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    if (!containerRef.current) {
+      setViewport((v) => ({
+        ...v,
+        scale: Math.min(3, Math.max(0.2, Number(e.target.value) / 100)),
+      }));
+      return;
+    }
+    const target = Number(e.target.value);
+    const newScale = Math.min(3, Math.max(0.2, target / 100));
+    const rect = containerRef.current.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    setViewport((v) => {
+      const worldX = (cx - v.x) / v.scale;
+      const worldY = (cy - v.y) / v.scale;
+      const newX = cx - worldX * newScale;
+      const newY = cy - worldY * newScale;
+      return { x: newX, y: newY, scale: newScale };
+    });
+  };
+
+  /** Fit to screen */
+  const fitToScreen = () => {
+    if (!containerRef.current || !nodes.length) return;
+    const rect = containerRef.current.getBoundingClientRect();
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+
+    nodes.forEach((node) => {
+      minX = Math.min(minX, node.x);
+      minY = Math.min(minY, node.y);
+      maxX = Math.max(maxX, node.x + node.width);
+      maxY = Math.max(maxY, node.y + node.height);
+    });
+
+    if (minX === Infinity || minY === Infinity) return;
+
+    const boardWidth = maxX - minX;
+    const boardHeight = maxY - minY;
+
+    const margin = 50;
+    const scaleX = (rect.width - margin * 2) / boardWidth;
+    const scaleY = (rect.height - margin * 2) / boardHeight;
+    const newScale = Math.max(0.2, Math.min(scaleX, scaleY));
+
+    const worldCenterX = (minX + maxX) / 2;
+    const worldCenterY = (minY + maxY) / 2;
+
+    const viewportCenterX = rect.width / 2;
+    const viewportCenterY = rect.height / 2;
+
+    const newX = viewportCenterX - worldCenterX * newScale;
+    const newY = viewportCenterY - worldCenterY * newScale;
+
+    setViewport({ x: newX, y: newY, scale: newScale });
+  };
+
+  /** 拖曳模板產生節點 */
+  const createNodeFromTemplate = (tpl: Node) => {
+    recordHistory();
+    const newNode: Node = {
+      ...tpl,
+      id: createId(),
+      x: tpl.x + 20,
+      y: tpl.y + 20,
+    };
+    setNodes((prev) => [...prev, newNode]);
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!containerRef.current) return;
+    const dataType = e.dataTransfer.getData("application/x-template-type");
+    const tplId = e.dataTransfer.getData("application/x-template-id");
+    const rect = containerRef.current.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    if (dataType === "template" && tplId) {
+      const tpl = templateNodes.find((t) => t.id === tplId);
+      if (tpl) {
+        recordHistory();
+        const newNode: Node = {
+          ...tpl,
+          id: createId(),
+          x: worldX,
+          y: worldY,
+        };
+        setNodes((prev) => [...prev, newNode]);
+      }
+    } else {
+      const file = e.dataTransfer.files?.[0];
+      if (file && file.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const dataUrl = ev.target?.result as string;
+          recordHistory();
+          const newNode: ImageNode = {
+            id: createId(),
+            type: "image",
+            x: worldX,
+            y: worldY,
+            width: 160,
+            height: 160,
+            imageDataUrl: dataUrl,
+          };
+          setNodes((prev) => [...prev, newNode]);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+  };
+
+  const handleResizeHandleMouseDown = (
+    e: MouseEvent<HTMLDivElement>,
+    node: Node,
+    handle: ResizeHandle
+  ) => {
+    e.stopPropagation();
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const startX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const startY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+    setResizeState({
+      nodeId: node.id,
+      handle,
+      startX,
+      startY,
+      startWidth: node.width,
+      startHeight: node.height,
+    });
+    isResizingRef.current = true;
+    recordHistory();
+  };
+
+  const handleToolChange = (newTool: Tool) => {
+    setTool(newTool);
+  };
+
+  const handleDoubleClickNode = (node: Node) => {
+    setEditingId(node.id);
+  };
+
+  const handleNodeTextChange = (nodeId: string, newText: string) => {
+    setNodes((prev) =>
+      prev.map((node) => (node.id === nodeId ? { ...node, text: newText } : node))
+    );
+  };
+
+  const handleNodeTableCellChange = (
+    nodeId: string,
+    rowIndex: number,
+    colIndex: number,
+    value: string
+  ) => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId || node.type !== "table") return node;
+        const newCells = node.cells.map((row, r) =>
+          row.map((cell, c) => (r === rowIndex && c === colIndex ? value : cell))
+        );
+        return { ...node, cells: newCells };
+      })
+    );
+  };
+
+  const addTableRow = (nodeId: string) => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId || node.type !== "table") return node;
+        const newRow = Array(node.cols).fill("");
+        return { ...node, rows: node.rows + 1, cells: [...node.cells, newRow] };
+      })
+    );
+  };
+
+  const removeTableRow = (nodeId: string) => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId || node.type !== "table") return node;
+        if (node.rows <= 1) return node;
+        return {
+          ...node,
+          rows: node.rows - 1,
+          cells: node.cells.slice(0, -1),
+        };
+      })
+    );
+  };
+
+  const addTableColumn = (nodeId: string) => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId || node.type !== "table") return node;
+        return {
+          ...node,
+          cols: node.cols + 1,
+          cells: node.cells.map((row) => [...row, ""]),
+        };
+      })
+    );
+  };
+
+  const removeTableColumn = (nodeId: string) => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.id !== nodeId || node.type !== "table") return node;
+        if (node.cols <= 1) return node;
+        return {
+          ...node,
+          cols: node.cols - 1,
+          cells: node.cells.map((row) => row.slice(0, -1)),
+        };
+      })
+    );
+  };
+
+  const deleteSelectedNode = () => {
+    if (!selectedIds.length) return;
+    recordHistory();
+    const selectedSet = new Set(selectedIds);
+    setNodes((prev) => prev.filter((n) => !selectedSet.has(n.id)));
+    setEdges((prev) =>
+      prev.filter(
+        (edge) => !selectedSet.has(edge.fromId) && !selectedSet.has(edge.toId)
+      )
+    );
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const handleConnectClick = (node: Node) => {
+    if (!connectingFrom) {
+      setConnectingFrom(node.id);
+    } else if (connectingFrom === node.id) {
+      setConnectingFrom(null);
+    } else {
+      recordHistory();
+      setEdges((prev) => [
+        ...prev,
+        { id: createId(), fromId: connectingFrom, toId: node.id },
+      ]);
+      setConnectingFrom(null);
+    }
+  };
+
+  const toggleTemplatePanel = () => {
+    setIsSidebarOpen((prev) => !prev);
+  };
+
+  const toggleOutlinePanel = () => {
+    setIsOutlineOpen((prev) => !prev);
+  };
+
+  const toggleRightPanel = () => {
+    setIsRightPanelOpen((prev) => !prev);
+  };
+
+  const handleSelectionModeChange = (mode: SelectionMode) => {
+    setSelectionMode(mode);
+  };
+
+  const handleApplyFormatPainter = () => {
+    if (!primaryId || !copiedStyle) return;
+    recordHistory();
+    setNodes((prev) =>
+      prev.map((node) =>
+        selectedIds.includes(node.id)
+          ? {
+              ...node,
+              bgColor:
+                copiedStyle.bgColor !== undefined
+                  ? copiedStyle.bgColor
+                  : node.bgColor,
+              fontSize:
+                copiedStyle.fontSize !== undefined
+                  ? copiedStyle.fontSize
+                  : node.fontSize,
+              owner:
+                copiedStyle.owner !== undefined
+                  ? copiedStyle.owner
+                  : node.owner,
+              level:
+                copiedStyle.level !== undefined
+                  ? copiedStyle.level
+                  : node.level,
+              categoryTag:
+                copiedStyle.categoryTag !== undefined
+                  ? copiedStyle.categoryTag
+                  : node.categoryTag,
+            }
+          : node
+      )
+    );
+  };
+
+  const handleFormatPainterToggle = () => {
+    if (!primaryId) return;
+    const node = nodes.find((n) => n.id === primaryId);
+    if (!node) return;
+
+    const newCopiedStyle: typeof copiedStyle = {
+      bgColor: node.bgColor,
+      fontSize: node.fontSize,
+      owner: node.owner,
+      level: node.level,
+      categoryTag: node.categoryTag,
+    };
+    setCopiedStyle(newCopiedStyle);
+    setFormatPainterActive((prev) => !prev);
+  };
+
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        redo();
+      } else {
+        undo();
+      }
+      return;
+    }
+
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      deleteSelectedNode();
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c") {
+      e.preventDefault();
+      if (!selectedIds.length) return;
+      const selectedNodes = nodes.filter((n) => selectedIds.includes(n.id));
+      const selectedIdSet = new Set(selectedIds);
+      const selectedEdges = edges.filter(
+        (edge) =>
+          selectedIdSet.has(edge.fromId) && selectedIdSet.has(edge.toId)
+      );
+      setClipboardNodes(JSON.parse(JSON.stringify(selectedNodes)));
+      setClipboardEdges(JSON.parse(JSON.stringify(selectedEdges)));
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "v") {
+      e.preventDefault();
+      if (!clipboardNodes || !clipboardNodes.length) return;
+      recordHistory();
+      const idMap = new Map<string, string>();
+      const clonedNodes: Node[] = clipboardNodes.map((node) => {
+        const newId = createId();
+        idMap.set(node.id, newId);
+        const offsetX = 30;
+        const offsetY = 30;
+        return {
+          ...node,
+          id: newId,
+          x: node.x + offsetX,
+          y: node.y + offsetY,
+        };
+      });
+      const clonedEdges: Edge[] =
+        clipboardEdges?.map((edge) => {
+          const newFrom = idMap.get(edge.fromId);
+          const newTo = idMap.get(edge.toId);
+          if (!newFrom || !newTo) return null as any;
+          return {
+            ...edge,
+            id: createId(),
+            fromId: newFrom,
+            toId: newTo,
+          };
+        }) || [];
+      const validEdges = clonedEdges.filter(Boolean) as Edge[];
+      setNodes((prev) => [...prev, ...clonedNodes]);
+      setEdges((prev) => [...prev, ...validEdges]);
+      setSelectedIds(clonedNodes.map((n) => n.id));
+      setPrimaryId(clonedNodes[0]?.id || null);
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      fitToScreen();
+      return;
+    }
+
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      (e.key === "+" || e.key === "=" || e.key === "-")
+    ) {
+      e.preventDefault();
+      const direction = e.key === "-" ? -1 : 1;
+      const factor = direction > 0 ? 1.1 : 1 / 1.1;
+      if (!containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const mx = rect.width / 2;
+      const my = rect.height / 2;
+      setViewport((v) => {
+        const newScale = Math.min(3, Math.max(0.2, v.scale * factor));
+        const worldX = (mx - v.x) / v.scale;
+        const worldY = (my - v.y) / v.scale;
+        const newX = mx - worldX * newScale;
+        const newY = my - worldY * newScale;
+        return { x: newX, y: newY, scale: newScale };
+      });
+      return;
+    }
+  };
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => handleKeyDown(e);
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
+
+  /** 將專案物件載入到 state */
+  const importProject = (project: ProjectFileV2) => {
+    setProjectName(project.projectName);
+    setPages(project.pages);
+    const nextActive =
+      project.activePageId || project.pages[0]?.id || null;
+    setActivePageId(nextActive);
+    const activePage = project.pages.find((p) => p.id === nextActive);
+    if (activePage) {
+      setNodes(activePage.nodes);
+      setEdges(activePage.edges);
+      setViewport(activePage.viewport);
+    } else if (project.pages[0]) {
+      setNodes(project.pages[0].nodes);
+      setEdges(project.pages[0].edges);
+      setViewport(project.pages[0].viewport);
+    }
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  /** 匯入 .lmwb / .json / .zip */
+  const handleFileInputChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    try {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const name = file.name.toLowerCase();
+
+      // 1) .lmwb / .json → 專案檔
+      if (name.endsWith(".lmwb") || name.endsWith(".json")) {
+        // 1-1) 若是 .lmwb，先嘗試當作 ZIP 專案檔處理
+        if (name.endsWith(".lmwb")) {
+          try {
+            const buf = await file.arrayBuffer();
+            const zip = await JSZip.loadAsync(buf);
+            const projFile = zip.file("project.json");
+            if (projFile) {
+              const text = await projFile.async("text");
+              const project = JSON.parse(text) as ProjectFileV2;
+              if (project.version === 2 && project.pages?.length) {
+                recordHistory();
+                importProject(project);
+                return;
+              }
+            }
+          } catch (zipErr) {
+            console.warn(
+              "載入 .lmwb ZIP 專案失敗，改用純文字 JSON 解析。",
+              zipErr
+            );
+            // 繼續往下用純文字 JSON parse
+          }
+        }
+
+        // 1-2) 純文字 JSON 專案檔
+        const text = await file.text();
+        try {
+          const project = JSON.parse(text) as ProjectFileV2;
+          if (project.version === 2 && project.pages?.length) {
+            recordHistory();
+            importProject(project);
+          } else {
+            alert("不支援的檔案版本（只支援 version = 2）。");
+          }
+        } catch (err) {
+          console.error("解析專案檔案失敗", err);
+          alert("解析專案檔案失敗，請確認格式是否正確。");
+        } finally {
+          e.target.value = "";
+        }
+        return;
+      }
+
+      // 2) .zip → 文字大綱匯入成節點（保留原本功能）
+      if (name.endsWith(".zip")) {
+        const arrayBuffer = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        const txtEntry = Object.values(zip.files).find((f) =>
+          f.name.toLowerCase().endsWith(".txt")
+        );
+        if (!txtEntry) {
+          alert("ZIP 檔內未找到 .txt 策略匯出檔。");
+          return;
+        }
+        const txtContent = await txtEntry.async("text");
+        const lines = txtContent.split(/\r?\n/);
+        const newNodes: Node[] = [];
+        let y = 80;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          const isL1 = /^\d+[\.\)]/.test(trimmed);
+          const isL2 = /^\s{2,}\d+[\.\)]/.test(trimmed);
+          const isL3 = /^\s{4,}\d+[\.\)]/.test(trimmed);
+
+          let level: StrategyLevel = "Info";
+          let x = 200;
+          let width = 260;
+          if (isL1) {
+            level = "L1";
+            x = 80;
+            width = 280;
+          } else if (isL2) {
+            level = "L2";
+            x = 380;
+            width = 260;
+          } else if (isL3) {
+            level = "L3";
+            x = 680;
+            width = 260;
+          }
+
+          const text = trimmed.replace(/^\s*\d+[\.\)]\s*/, "");
+          newNodes.push({
+            id: createId(),
+            type: "note",
+            x,
+            y,
+            width,
+            height: 60,
+            text,
+            bgColor:
+              level === "L1"
+                ? "#fee2e2"
+                : level === "L2"
+                ? "#e0f2fe"
+                : level === "L3"
+                ? "#ecfeff"
+                : "#e5e7eb",
+            fontSize: 13,
+            level,
+          });
+          y += 80;
+        }
+        recordHistory();
+        setNodes((prev) => [...prev, ...newNodes]);
+        return;
+      }
+
+      alert("只支援 .lmwb / .json / .zip 檔案匯入。");
+    } catch (err) {
+      console.error("匯入檔案時發生錯誤", err);
+      alert("匯入檔案失敗，請稍後再試。");
+    } finally {
+      e.target.value = "";
+    }
+  };
+
+  /** 匯出 .lmwb 專案 */
+  const handleExportProject = async () => {
+    const project: ProjectFileV2 = {
+      version: 2,
+      projectName,
+      activePageId,
+      pages: pages.map((p) =>
+        p.id === activePageId
+          ? { ...p, nodes, edges, viewport }
+          : { ...p }
+      ),
+    };
+    const blob = new Blob([JSON.stringify(project, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${projectName || "strategy"}.lmwb`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  /** 匯出畫布 PNG */
+  const handleExportScreenshot = async () => {
+    if (!canvasRef.current) return;
+    try {
+      const canvasDom = canvasRef.current;
+      const worldPadding = 80;
+
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      nodes.forEach((node) => {
+        minX = Math.min(minX, node.x);
+        minY = Math.min(minY, node.y);
+        maxX = Math.max(maxX, node.x + node.width);
+        maxY = Math.max(maxY, node.y + node.height);
+      });
+      if (minX === Infinity || minY === Infinity) {
+        alert("畫面上沒有任何節點，無法輸出圖片。");
+        return;
+      }
+      const worldWidth = maxX - minX;
+      const worldHeight = maxY - minY;
+
+      const exportWidth = Math.min(worldWidth + worldPadding * 2, 3000);
+      const exportHeight = Math.min(worldHeight + worldPadding * 2, 3000);
+
+      const prevViewport = { ...viewport };
+      const tempViewport: Viewport = {
+        x: worldPadding - minX,
+        y: worldPadding - minY,
+        scale: 1,
+      };
+      setViewport(tempViewport);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const scaleFactor = 2;
+      const canvas = await html2canvas(canvasDom, {
+        backgroundColor: "#ffffff",
+        scale: scaleFactor,
+        width: exportWidth,
+        height: exportHeight,
+        x: 0,
+        y: 0,
+        scrollX: 0,
+        scrollY: 0,
+        windowWidth: exportWidth,
+        windowHeight: exportHeight,
+      });
+
+      setViewport(prevViewport);
+
+      const dataUrl = canvas.toDataURL("image/png");
+      const link = document.createElement("a");
+      link.href = dataUrl;
+      link.download = `${projectName || "strategy"}_whiteboard.png`;
+      link.click();
+    } catch (err) {
+      console.error("輸出圖片時發生錯誤", err);
+      alert("輸出圖片失敗，請稍後再試。");
+    }
+  };
+
+  const handleProjectNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setProjectName(e.target.value);
+  };
+
+  const handleAddPage = () => {
+    const newPage: Page = {
+      id: createId(),
+      name: `Page ${pages.length + 1}`,
+      nodes: [],
+      edges: [],
+      viewport: defaultViewport,
+    };
+    setPages((prev) => [...prev, newPage]);
+    setActivePageId(newPage.id);
+    setNodes(newPage.nodes);
+    setEdges(newPage.edges);
+    setViewport(newPage.viewport);
+  };
+
+  const handlePageClick = (pageId: string) => {
+    const page = pages.find((p) => p.id === pageId);
+    if (!page) return;
+    setActivePageId(pageId);
+    setNodes(page.nodes);
+    setEdges(page.edges);
+    setViewport(page.viewport);
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const handlePageNameChange = (pageId: string, newName: string) => {
+    setPages((prev) =>
+      prev.map((p) =>
+        p.id === pageId
+          ? {
+              ...p,
+              name: newName,
+            }
+          : p
+      )
+    );
+  };
+
+  const handlePageDelete = (pageId: string) => {
+    if (pages.length <= 1) {
+      alert("至少要保留一個頁面。");
+      return;
+    }
+    const confirmDelete = window.confirm("確定要刪除此頁面嗎？");
+    if (!confirmDelete) return;
+    setPages((prev) => prev.filter((p) => p.id !== pageId));
+    if (activePageId === pageId) {
+      const nextPage = pages.find((p) => p.id !== pageId);
+      if (nextPage) {
+        setActivePageId(nextPage.id);
+        setNodes(nextPage.nodes);
+        setEdges(nextPage.edges);
+        setViewport(nextPage.viewport);
+      }
+    }
+  };
+
+  const activePage = pages.find((p) => p.id === activePageId) || pages[0];
+
+  /** Mini-map（可點選平移＋顯示視窗範圍） */
+  let miniMap: React.ReactNode = null;
+  if (containerRef.current && nodes.length > 0) {
+    const rect = containerRef.current.getBoundingClientRect();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    nodes.forEach((n) => {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.width);
+      maxY = Math.max(maxY, n.y + n.height);
+    });
+    if (minX !== Infinity) {
+      const worldW = maxX - minX || 1;
+      const worldH = maxY - minY || 1;
+      const miniW = 180;
+      const miniH = 120;
+      const scaleX = miniW / worldW;
+      const scaleY = miniH / worldH;
+      const miniScale = Math.min(scaleX, scaleY);
+
+      const viewWorldX = -viewport.x / viewport.scale;
+      const viewWorldY = -viewport.y / viewport.scale;
+      const viewWorldW = rect.width / viewport.scale;
+      const viewWorldH = rect.height / viewport.scale;
+
+      const viewX = (viewWorldX - minX) * miniScale;
+      const viewY = (viewWorldY - minY) * miniScale;
+      const viewW = viewWorldW * miniScale;
+      const viewH = viewWorldH * miniScale;
+
+      miniMap = (
+        <div className="pointer-events-auto absolute bottom-3 right-3 z-10 rounded-md border border-slate-400 bg-white/90 p-1 shadow">
+          <div className="mb-1 flex items-center justify-between text-[10px] text-slate-500">
+            <span>Mini-map</span>
+            <span>{Math.round(viewport.scale * 100)}%</span>
+          </div>
+          <div className="mb-1 flex items-center gap-1 text-[10px] text-slate-500">
+            <span className="whitespace-nowrap">Zoom</span>
+            <input
+              type="range"
+              min={20}
+              max={300}
+              value={Math.round(
+                Math.min(3, Math.max(0.2, viewport.scale)) * 100
+              )}
+              onChange={handleZoomSliderChange}
+              className="h-3 flex-1 cursor-pointer"
+            />
+          </div>
+          <div
+            className="relative cursor-pointer overflow-hidden rounded bg-slate-100"
+            style={{ width: miniW, height: miniH }}
+            onMouseDown={(e) => {
+              const rectMini = (
+                e.currentTarget as HTMLDivElement
+              ).getBoundingClientRect();
+              const mx = e.clientX - rectMini.left;
+              const my = e.clientY - rectMini.top;
+              setViewport((v) => {
+                if (!containerRef.current) return v;
+                const canvasRect =
+                  containerRef.current.getBoundingClientRect();
+                const viewWorldW = canvasRect.width / v.scale;
+                const viewWorldH = canvasRect.height / v.scale;
+                const worldX = mx / miniScale + minX - viewWorldW / 2;
+                const worldY = my / miniScale + minY - viewWorldH / 2;
+                return {
+                  ...v,
+                  x: -worldX * v.scale,
+                  y: -worldY * v.scale,
+                };
+              });
+            }}
+          >
+            {nodes.map((n) => {
+              const nx = (n.x - minX) * miniScale;
+              const ny = (n.y - minY) * miniScale;
+              const nw = n.width * miniScale;
+              const nh = n.height * miniScale;
+              return (
+                <div
+                  key={n.id}
+                  className="absolute rounded-[2px] border border-slate-400 bg-slate-300/80"
+                  style={{
+                    left: nx,
+                    top: ny,
+                    width: Math.max(nw, 2),
+                    height: Math.max(nh, 2),
+                  }}
+                />
+              );
+            })}
+
+            <div
+              className="absolute border border-blue-500 bg-blue-300/10"
+              style={{
+                left: viewX,
+                top: viewY,
+                width: viewW,
+                height: viewH,
+              }}
+            />
+          </div>
+        </div>
+      );
+    }
+  }
+
+  const outlineItems = nodes
+    .filter((n) => n.level === "L1" || n.level === "L2" || n.level === "L3")
+    .map((n) => ({
+      id: n.id,
+      text: n.text || "",
+      level: n.level || "Info",
+    }))
+    .sort((a, b) => {
+      const levelOrder: StrategyLevel[] = [
+        "L1",
+        "L2",
+        "L3",
+        "Info",
+      ];
+      const la = levelOrder.indexOf(a.level);
+      const lb = levelOrder.indexOf(b.level);
+      if (la !== lb) return la - lb;
+      return a.text.localeCompare(b.text);
+    });
+
+  const selectedNode = nodes.find((n) => n.id === primaryId) || null;
+
+  const handleNodePropertyChange = (
+    nodeId: string,
+    partial: Partial<Node>
+  ) => {
+    setNodes((prev) =>
+      prev.map((node) =>
+        node.id === nodeId ? { ...node, ...partial } : node
+      )
+    );
+  };
+
+  const handleNodeOwnerChange = (nodeId: string, owner: string) => {
+    handleNodePropertyChange(nodeId, { owner });
+  };
+
+  const handleNodeLevelChange = (
+    nodeId: string,
+    level: StrategyLevel
+  ) => {
+    handleNodePropertyChange(nodeId, { level });
+  };
+
+  const handleNodeCategoryTagChange = (
+    nodeId: string,
+    categoryTag: string
+  ) => {
+    handleNodePropertyChange(nodeId, { categoryTag });
+  };
+
+  const handleNodeImpactChange = (nodeId: string, impact: number) => {
+    handleNodePropertyChange(nodeId, { impact });
+  };
+
+  const handleNodeEffortChange = (nodeId: string, effort: number) => {
+    handleNodePropertyChange(nodeId, { effort });
+  };
+
+  const groupedOutline = outlineItems.reduce(
+    (acc, item) => {
+      acc[item.level].push(item);
+      return acc;
+    },
+    {
+      L1: [] as typeof outlineItems,
+      L2: [] as typeof outlineItems,
+      L3: [] as typeof outlineItems,
+      Info: [] as typeof outlineItems,
+    }
+  );
+
+  return (
+    <div
+      className="flex h-screen w-full flex-col bg-slate-200 text-slate-900"
+      style={{ overscrollBehavior: "none" }}
+    >
+      {/* 頂部工具列 */}
+      <header className="border-b border-slate-300 bg-slate-50">
+        <div className="flex items-center justify-between px-3 py-2 text-[13px]">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-slate-700">
+              未來規劃圖白板
+            </span>
+            <input
+              className="w-48 rounded border border-slate-300 px-2 py-1 text-[13px]"
+              value={projectName}
+              onChange={handleProjectNameChange}
+              placeholder="專案名稱"
+            />
+            <button
+              className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-600 hover:bg-slate-200"
+              onClick={fitToScreen}
+            >
+              Fit to Screen
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1">
+              <span className="text-[11px] text-slate-500">工具：</span>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  tool === "select"
+                    ? "bg-blue-600 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleToolChange("select")}
+              >
+                選取
+              </button>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  tool === "pan"
+                    ? "bg-blue-600 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleToolChange("pan")}
+              >
+                平移
+              </button>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  tool === "connect"
+                    ? "bg-blue-600 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleToolChange("connect")}
+              >
+                連線
+              </button>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-[11px] text-slate-500">
+                選取模式：
+              </span>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  selectionMode === "replace"
+                    ? "bg-slate-700 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleSelectionModeChange("replace")}
+              >
+                取代
+              </button>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  selectionMode === "add"
+                    ? "bg-slate-700 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleSelectionModeChange("add")}
+              >
+                加入
+              </button>
+              <button
+                className={`rounded px-2 py-1 text-xs ${
+                  selectionMode === "subtract"
+                    ? "bg-slate-700 text-white"
+                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                }`}
+                onClick={() => handleSelectionModeChange("subtract")}
+              >
+                扣除
+              </button>
+            </div>
+            <div className="ml-2 flex items-center gap-2">
+              <label className="flex cursor-pointer items-center gap-1 rounded border border-slate-300 bg-white px-2 py-1 text-[11px] hover:bg-slate-50">
+                <span>匯入專案</span>
+                <input
+                  type="file"
+                  accept=".lmwb,.json,.zip"
+                  className="hidden"
+                  onChange={handleFileInputChange}
+                />
+              </label>
+              <button
+                className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] hover:bg-slate-50"
+                onClick={handleExportProject}
+              >
+                匯出 .lmwb
+              </button>
+              <button
+                className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] hover:bg-slate-50"
+                onClick={handleExportScreenshot}
+              >
+                匯出圖片
+              </button>
+            </div>
+            <div className="ml-2 flex items-center gap-1 text-[11px] text-slate-500">
+              <span>Page:</span>
+              <div className="flex items-center gap-1">
+                {pages.map((p) => (
+                  <button
+                    key={p.id}
+                    className={`rounded px-2 py-1 text-xs ${
+                      p.id === activePageId
+                        ? "bg-blue-500 text-white"
+                        : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                    }`}
+                    onClick={() => handlePageClick(p.id)}
+                  >
+                    {p.name}
+                  </button>
+                ))}
+                <button
+                  className="ml-1 rounded bg-slate-100 px-2 py-1 text-xs text-slate-700 hover:bg-slate-200"
+                  onClick={handleAddPage}
+                >
+                  ＋
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* 主體區域 */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* 左側模板 */}
+        {isSidebarOpen && (
+          <aside
+            className="flex h-full flex-col border-r border-slate-300 bg-slate-50"
+            style={{ width: TEMPLATE_PANEL_WIDTH }}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 px-2 py-1 text-[12px]">
+              <span className="font-semibold text-slate-700">
+                元件模板
+              </span>
+              <button
+                className="text-xs text-slate-500 hover:text-slate-700"
+                onClick={toggleTemplatePanel}
+              >
+                關閉
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-2 text-[12px]">
+              <div className="mb-2 text-[11px] text-slate-500">
+                拖曳到畫布即可建立區塊。
+              </div>
+              {templateNodes.map((tpl) => (
+                <div
+                  key={tpl.id}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData(
+                      "application/x-template-type",
+                      "template"
+                    );
+                    e.dataTransfer.setData(
+                      "application/x-template-id",
+                      tpl.id
+                    );
+                  }}
+                  onDoubleClick={() => createNodeFromTemplate(tpl)}
+                  className="mb-2 cursor-move rounded border border-slate-300 bg-white p-2 shadow-sm hover:bg-slate-50"
+                >
+                  <div className="text-[11px] text-slate-500">
+                    {tpl.type === "category"
+                      ? "類別區塊"
+                      : "文字卡片"}
+                  </div>
+                  <div className="mt-1 rounded border border-dashed border-slate-300 bg-slate-100 p-1 text-[11px]">
+                    {tpl.text}
+                  </div>
+                </div>
+              ))}
+              <div className="mt-4 border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+                也可以將圖片檔直接拖曳進畫布，產生圖片節點。
+              </div>
+            </div>
+          </aside>
+        )}
+
+        {!isSidebarOpen && (
+          <button
+            className="absolute left-1 top-[60px] z-20 rounded border border-slate-300 bg-slate-50 px-1 py-0.5 text-[11px] text-slate-500 hover:bg-slate-100"
+            onClick={toggleTemplatePanel}
+          >
+            開啟模板
+          </button>
+        )}
+
+        {/* 中間畫布 */}
+        <div
+          ref={containerRef}
+          className="relative flex flex-1 overflow-hidden bg-slate-100"
+          onMouseDown={handleCanvasMouseDown}
+          onMouseMove={handleCanvasMouseMove}
+          onMouseUp={handleCanvasMouseUp}
+          onMouseLeave={handleCanvasMouseUp}
+          onWheel={handleWheel}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+        >
+          <div
+            ref={canvasRef}
+            className="relative h-[4000px] w-[4000px]"
+            style={{
+              transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
+              transformOrigin: "0 0",
+            }}
+          >
+            <div className="absolute left-0 top-0 h-full w-full bg-[radial-gradient(circle_at_1px_1px,#e5e7eb_1px,transparent_0)] bg-[length:20px_20px]" />
+
+            {nodes.map((node) => {
+              const isSelected = selectedIds.includes(node.id);
+              const isPivot = primaryId === node.id;
+
+              const baseBorderColor = isPivot
+                ? "border-blue-500"
+                : isSelected
+                ? "border-blue-300"
+                : "border-slate-300";
+
+              const baseShadow = isSelected
+                ? "shadow-[0_0_0_1px_rgba(37,99,235,0.6)]"
+                : "shadow-sm";
+
+              const bg =
+                node.bgColor ||
+                (node.type === "category"
+                  ? "#fef3c7"
+                  : node.type === "note"
+                  ? "#e5e7eb"
+                  : node.type === "text"
+                  ? "#f9fafb"
+                  : "#ffffff");
+
+              const fontSize = node.fontSize || 13;
+
+              return (
+                <div
+                  key={node.id}
+                  className={`group absolute box-border cursor-move rounded border ${baseBorderColor} ${baseShadow} bg-white/90`}
+                  style={{
+                    left: node.x,
+                    top: node.y,
+                    width: node.width,
+                    height: node.height,
+                    backgroundColor: bg,
+                  }}
+                  onMouseDown={(e) => handleNodeMouseDown(e, node)}
+                  onDoubleClick={() => handleDoubleClickNode(node)}
+                >
+                  <div className="flex h-full flex-col">
+                    <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50/80 px-2 py-1 text-[10px] text-slate-500">
+                      <div className="flex items-center gap-1">
+                        <span>
+                          {node.type === "category"
+                            ? "類別"
+                            : node.type === "note"
+                            ? "便條"
+                            : node.type === "table"
+                            ? "表格"
+                            : node.type === "image"
+                            ? "圖片"
+                            : "文字"}
+                        </span>
+                        {node.level && (
+                          <span className="rounded bg-slate-200 px-1 text-[9px]">
+                            {node.level}
+                          </span>
+                        )}
+                        {node.categoryTag && (
+                          <span className="rounded bg-emerald-100 px-1 text-[9px] text-emerald-700">
+                            {node.categoryTag}
+                          </span>
+                        )}
+                      </div>
+                      {tool === "connect" && (
+                        <button
+                          className={`rounded px-1 text-[10px] ${
+                            connectingFrom === node.id
+                              ? "bg-blue-500 text-white"
+                              : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                          }`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleConnectClick(node);
+                          }}
+                        >
+                          {connectingFrom === node.id ? "取消" : "連線"}
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex flex-1 flex-col px-2 py-1">
+                      {node.type === "image" ? (
+                        <div className="flex h-full w-full items-center justify-center overflow-hidden">
+                          <img
+                            src={(node as ImageNode).imageDataUrl}
+                            alt="image-node"
+                            className="max-h-full max-w-full object-contain"
+                          />
+                        </div>
+                      ) : node.type === "table" ? (
+                        <div className="flex flex-1 flex-col overflow-auto">
+                          <table className="w-full border-collapse text-[11px]">
+                            <tbody>
+                              {(node as TableNode).cells.map(
+                                (row, rowIndex) => (
+                                  <tr key={rowIndex}>
+                                    {row.map((cell, colIndex) => (
+                                      <td
+                                        key={colIndex}
+                                        className="border border-slate-300 bg-white/70 px-1 py-0.5"
+                                      >
+                                        <textarea
+                                          className="h-full w-full resize-none bg-transparent text-[11px] leading-snug outline-none"
+                                          value={cell}
+                                          onChange={(e) =>
+                                            handleNodeTableCellChange(
+                                              node.id,
+                                              rowIndex,
+                                              colIndex,
+                                              e.target.value
+                                            )
+                                          }
+                                        />
+                                      </td>
+                                    ))}
+                                  </tr>
+                                )
+                              )}
+                            </tbody>
+                          </table>
+                          <div className="mt-1 flex justify-between text-[10px] text-slate-500">
+                            <div className="flex gap-1">
+                              <button
+                                className="rounded bg-slate-100 px-1 hover:bg-slate-200"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  addTableRow(node.id);
+                                }}
+                              >
+                                ＋列
+                              </button>
+                              <button
+                                className="rounded bg-slate-100 px-1 hover:bg-slate-200"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removeTableRow(node.id);
+                                }}
+                              >
+                                −列
+                              </button>
+                            </div>
+                            <div className="flex gap-1">
+                              <button
+                                className="rounded bg-slate-100 px-1 hover:bg-slate-200"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  addTableColumn(node.id);
+                                }}
+                              >
+                                ＋欄
+                              </button>
+                              <button
+                                className="rounded bg-slate-100 px-1 hover:bg-slate-200"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removeTableColumn(node.id);
+                                }}
+                              >
+                                −欄
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : editingId === node.id ? (
+                        <textarea
+                          className="h-full w-full resize-none rounded border border-slate-300 bg-white/80 px-1 py-1 text-[13px] leading-snug outline-none"
+                          style={{ fontSize }}
+                          value={node.text || ""}
+                          autoFocus
+                          onBlur={() => setEditingId(null)}
+                          onChange={(e) =>
+                            handleNodeTextChange(node.id, e.target.value)
+                          }
+                        />
+                      ) : (
+                        <div
+                          className="h-full w-full whitespace-pre-wrap break-words text-[13px] leading-snug"
+                          style={{ fontSize }}
+                        >
+                          {node.text}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {isSelected && (
+                    <ResizeHandleBox
+                      node={node}
+                      onResizeHandleMouseDown={handleResizeHandleMouseDown}
+                    />
+                  )}
+                </div>
+              );
+            })}
+
+            {edges.map((edge) => {
+              const from = nodes.find((n) => n.id === edge.fromId);
+              const to = nodes.find((n) => n.id === edge.toId);
+              if (!from || !to) return null;
+              const x1 = from.x + from.width / 2;
+              const y1 = from.y + from.height / 2;
+              const x2 = to.x + to.width / 2;
+              const y2 = to.y + to.height / 2;
+              return (
+                <svg
+                  key={edge.id}
+                  className="pointer-events-none absolute left-0 top-0 h-full w-full"
+                >
+                  <defs>
+                    <marker
+                      id={`arrow-${edge.id}`}
+                      markerWidth="6"
+                      markerHeight="6"
+                      refX="5"
+                      refY="3"
+                      orient="auto"
+                    >
+                      <path
+                        d="M0,0 L6,3 L0,6"
+                        fill="none"
+                        stroke="#475569"
+                      />
+                    </marker>
+                  </defs>
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="#64748b"
+                    strokeWidth={1.5}
+                    markerEnd={`url(#arrow-${edge.id})`}
+                  />
+                </svg>
+              );
+            })}
+
+            {selectionRect && (
+              <div
+                className="pointer-events-none absolute border border-blue-400/80 bg-blue-200/20"
+                style={{
+                  left: selectionRect.x,
+                  top: selectionRect.y,
+                  width: selectionRect.w,
+                  height: selectionRect.h,
+                }}
+              />
+            )}
+          </div>
+
+          {miniMap}
+        </div>
+
+        {/* 右側大綱 */}
+        {isOutlineOpen && (
+          <aside
+            className="flex h-full flex-col border-l border-slate-300 bg-slate-50"
+            style={{ width: OUTLINE_PANEL_WIDTH }}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 px-2 py-1 text-[12px]">
+              <span className="font-semibold text-slate-700">
+                結構大綱
+              </span>
+              <button
+                className="text-xs text-slate-500 hover:text-slate-700"
+                onClick={toggleOutlinePanel}
+              >
+                關閉
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-2 text-[12px]">
+              {(["L1", "L2", "L3"] as StrategyLevel[]).map((level) => {
+                const items = groupedOutline[level];
+                if (!items.length) return null;
+                return (
+                  <div key={level} className="mb-3">
+                    <div className="mb-1 text-[11px] font-semibold text-slate-600">
+                      {level === "L1"
+                        ? "L1 主題"
+                        : level === "L2"
+                        ? "L2 次主題"
+                        : "L3 執行項"}
+                    </div>
+                    <ul className="space-y-1">
+                      {items.map((item) => (
+                        <li key={item.id}>
+                          <button
+                            className={`w-full rounded px-2 py-1 text-left text-[11px] ${
+                              selectedIds.includes(item.id)
+                                ? "bg-blue-100 text-blue-700"
+                                : "bg-white text-slate-700 hover:bg-slate-100"
+                            }`}
+                            onClick={() => {
+                              setSelectedIds([item.id]);
+                              setPrimaryId(item.id);
+                              const node = nodes.find(
+                                (n) => n.id === item.id
+                              );
+                              if (node && containerRef.current) {
+                                const rect =
+                                  containerRef.current.getBoundingClientRect();
+                                const targetX =
+                                  rect.width / 2 -
+                                  (node.x + node.width / 2) *
+                                    viewport.scale;
+                                const targetY =
+                                  rect.height / 2 -
+                                  (node.y + node.height / 2) *
+                                    viewport.scale;
+                                setViewport((v) => ({
+                                  ...v,
+                                  x: targetX,
+                                  y: targetY,
+                                }));
+                              }
+                            }}
+                          >
+                            {item.text || "(未命名)"}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
+        )}
+
+        {!isOutlineOpen && (
+          <button
+            className="absolute right-[330px] top-[60px] z-20 rounded border border-slate-300 bg-slate-50 px-1 py-0.5 text-[11px] text-slate-500 hover:bg-slate-100"
+            onClick={toggleOutlinePanel}
+          >
+            大綱
+          </button>
+        )}
+
+        {/* 右側屬性面板 */}
+        {isRightPanelOpen && (
+          <aside
+            className="flex h-full flex-col border-l border-slate-300 bg-slate-50"
+            style={{ width: RIGHT_PANEL_WIDTH }}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 px-2 py-1 text-[12px]">
+              <span className="font-semibold text-slate-700">
+                節點屬性
+              </span>
+              <button
+                className="text-xs text-slate-500 hover:text-slate-700"
+                onClick={toggleRightPanel}
+              >
+                關閉
+              </button>
+            </div>
+            <div className="flex flex-1 flex-col p-2 text-[12px]">
+              {!selectedNode ? (
+                <div className="text-[12px] text-slate-500">
+                  尚未選取節點。
+                  <br />
+                  ● 可點選節點查看屬性
+                  <br />
+                  ● 可使用框選一次選取多個節點
+                </div>
+              ) : (
+                <div className="flex-1 space-y-3 overflow-auto pr-1 text-[12px]">
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      節點 ID
+                    </div>
+                    <div className="rounded border border-slate-200 bg-slate-100 px-2 py-1 text-[11px] text-slate-600">
+                      {selectedNode.id}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      類型
+                    </div>
+                    <div className="rounded border border-slate-200 bg-slate-100 px-2 py-1 text-[11px] text-slate-700">
+                      {selectedNode.type === "category"
+                        ? "類別區塊"
+                        : selectedNode.type === "note"
+                        ? "便條"
+                        : selectedNode.type === "table"
+                        ? "表格"
+                        : selectedNode.type === "image"
+                        ? "圖片"
+                        : "文字"}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      擁有者 / 負責人
+                    </div>
+                    <input
+                      className="w-full rounded border border-slate-300 px-2 py-1 text-[12px]"
+                      value={selectedNode.owner || ""}
+                      onChange={(e) =>
+                        handleNodeOwnerChange(
+                          selectedNode.id,
+                          e.target.value
+                        )
+                      }
+                      placeholder="輸入負責人名稱（可選）"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      策略層級（Level）
+                    </div>
+                    <div className="flex gap-1">
+                      {(["L1", "L2", "L3", "Info"] as StrategyLevel[]).map(
+                        (level) => (
+                          <button
+                            key={level}
+                            className={`flex-1 rounded px-2 py-1 text-[11px] ${
+                              selectedNode.level === level
+                                ? "bg-blue-600 text-white"
+                                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                            }`}
+                            onClick={() =>
+                              handleNodeLevelChange(
+                                selectedNode.id,
+                                level
+                              )
+                            }
+                          >
+                            {level === "L1"
+                              ? "L1 主題"
+                              : level === "L2"
+                              ? "L2 次主題"
+                              : level === "L3"
+                              ? "L3 執行項"
+                              : "Info"}
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      類別標籤（Category Tag）
+                    </div>
+                    <input
+                      className="w-full rounded border border-slate-300 px-2 py-1 text-[12px]"
+                      value={selectedNode.categoryTag || ""}
+                      onChange={(e) =>
+                        handleNodeCategoryTagChange(
+                          selectedNode.id,
+                          e.target.value
+                        )
+                      }
+                      placeholder="例如：市場 / 技術 / 營運 / 財務 / 風險 / 機會…"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      Impact / Effort（1–5）
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="flex-1">
+                        <div className="mb-0.5 text-[11px] text-slate-500">
+                          Impact（影響力）
+                        </div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={5}
+                          className="w-full rounded border border-slate-300 px-2 py-1 text-[12px]"
+                          value={selectedNode.impact ?? ""}
+                          onChange={(e) =>
+                            handleNodeImpactChange(
+                              selectedNode.id,
+                              e.target.value
+                                ? Number(e.target.value)
+                                : 0
+                            )
+                          }
+                          placeholder="1–5"
+                        />
+                      </div>
+                      <div className="flex-1">
+                        <div className="mb-0.5 text-[11px] text-slate-500">
+                          Effort（投入成本）
+                        </div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={5}
+                          className="w-full rounded border border-slate-300 px-2 py-1 text-[12px]"
+                          value={selectedNode.effort ?? ""}
+                          onChange={(e) =>
+                            handleNodeEffortChange(
+                              selectedNode.id,
+                              e.target.value
+                                ? Number(e.target.value)
+                                : 0
+                            )
+                          }
+                          placeholder="1–5"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      外觀設定
+                    </div>
+                    <div className="mb-1 flex items-center gap-2">
+                      <label className="flex items-center gap-1 text-[11px] text-slate-600">
+                        <span>背景色：</span>
+                        <input
+                          type="color"
+                          value={selectedNode.bgColor || "#ffffff"}
+                          onChange={(e) =>
+                            handleNodePropertyChange(
+                              selectedNode.id,
+                              { bgColor: e.target.value }
+                            )
+                          }
+                        />
+                      </label>
+                      <label className="flex items-center gap-1 text-[11px] text-slate-600">
+                        <span>字級：</span>
+                        <input
+                          type="number"
+                          min={10}
+                          max={24}
+                          className="w-16 rounded border border-slate-300 px-1 py-0.5 text-[11px]"
+                          value={selectedNode.fontSize || 13}
+                          onChange={(e) =>
+                            handleNodePropertyChange(
+                              selectedNode.id,
+                              {
+                                fontSize: Number(e.target.value) || 13,
+                              }
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="border-t border-slate-200 pt-2">
+                    <div className="mb-1 flex items-center justify-between">
+                      <span className="text-xs text-slate-500">
+                        格式刷（Format Painter）
+                      </span>
+                      <button
+                        className={`rounded px-2 py-1 text-[11px] ${
+                          formatPainterActive
+                            ? "bg-amber-500 text-white"
+                            : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                        }`}
+                        onClick={handleFormatPainterToggle}
+                      >
+                        {formatPainterActive ? "停用格式刷" : "啟動格式刷"}
+                      </button>
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      啟動後，選取其它節點並按下「套用格式」，可將目前節點的顏色
+                      / Level / Tag 等格式套用到多個節點。
+                    </div>
+                    <button
+                      className="mt-1 w-full rounded bg-slate-100 py-1 text-[11px] text-slate-700 hover:bg-slate-200"
+                      onClick={handleApplyFormatPainter}
+                    >
+                      對目前選取節點套用格式
+                    </button>
+                  </div>
+
+                  {selectedIds.length >= 2 && (
+                    <div className="border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+                      多選排列工具可在上方 Arrange 工具列中使用。
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </aside>
+        )}
+
+        {!isRightPanelOpen && (
+          <button
+            className="absolute right-1 top-[60px] z-20 rounded border border-slate-300 bg-slate-50 px-1 py-0.5 text-[11px] text-slate-500 hover:bg-slate-100"
+            onClick={toggleRightPanel}
+          >
+            屬性
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 節點四周的 resize 小圓點 */
+function ResizeHandleBox({
+  node,
+  onResizeHandleMouseDown,
+}: {
+  node: Node;
+  onResizeHandleMouseDown: (
+    e: MouseEvent<HTMLDivElement>,
+    node: Node,
+    handle: ResizeHandle
+  ) => void;
+}) {
+  const handleBase =
+    "absolute h-2 w-2 bg-white border border-blue-500 rounded-full";
+
+  return (
+    <>
+      <div
+        className={handleBase}
+        style={{ left: -4, top: -4, cursor: "nwse-resize" }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "top-left")}
+      />
+      <div
+        className={handleBase}
+        style={{
+          left: "50%",
+          top: -4,
+          transform: "translateX(-50%)",
+          cursor: "ns-resize",
+        }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "top")}
+      />
+      <div
+        className={handleBase}
+        style={{ right: -4, top: -4, cursor: "nesw-resize" }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "top-right")}
+      />
+      <div
+        className={handleBase}
+        style={{
+          right: -4,
+          top: "50%",
+          transform: "translateY(-50%)",
+          cursor: "ew-resize",
+        }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "right")}
+      />
+      <div
+        className={handleBase}
+        style={{ right: -4, bottom: -4, cursor: "nwse-resize" }}
+        onMouseDown={(e) =>
+          onResizeHandleMouseDown(e, node, "bottom-right")
+        }
+      />
+      <div
+        className={handleBase}
+        style={{
+          left: "50%",
+          bottom: -4,
+          transform: "translateX(-50%)",
+          cursor: "ns-resize",
+        }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "bottom")}
+      />
+      <div
+        className={handleBase}
+        style={{ left: -4, bottom: -4, cursor: "nesw-resize" }}
+        onMouseDown={(e) =>
+          onResizeHandleMouseDown(e, node, "bottom-left")
+        }
+      />
+      <div
+        className={handleBase}
+        style={{
+          left: -4,
+          top: "50%",
+          transform: "translateY(-50%)",
+          cursor: "ew-resize",
+        }}
+        onMouseDown={(e) => onResizeHandleMouseDown(e, node, "left")}
+      />
+    </>
+  );
+}

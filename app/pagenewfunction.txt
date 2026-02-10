@@ -1,0 +1,3421 @@
+"use client";
+
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  MouseEvent,
+  WheelEvent,
+} from "react";
+import html2canvas from "html2canvas";
+import JSZip from "jszip";
+
+// ⬇⬇⬇ 新增：從 types.ts 把所有型別／常數匯入
+import {
+  Tool,
+  NodeType,
+  StrategyLevel,
+  Node,
+  ImageCrop,
+  Edge,
+  Viewport,
+  BoardState,
+  Page,
+  ProjectFileV2,
+  ResizeHandle,
+  STORAGE_KEY,
+  createId,
+  templateNodes,
+  droneTemplateNodes,
+  droneTemplateEdges,
+  robotTemplateNodes,
+  robotTemplateEdges,
+} from "../lib/whiteboard/types";
+
+// ⬇⬇⬇ 新增：從獨立檔案匯入 Canvas 元件
+import { GridBackground } from "../components/whiteboard/canvas/GridBackground";
+import EdgeLayer from "../components/whiteboard/canvas/EdgeLayer";
+import { WhiteboardNode } from "../components/whiteboard/canvas/WhiteboardNode";
+import { MiniMap } from "../components/whiteboard/canvas/MiniMap";
+import FreeDrawLayer from "../components/whiteboard/canvas/FreeDrawLayer";
+import type { Stroke } from "../lib/whiteboard/drawTypes";
+
+import {
+  useAutoSaveProjectToStorage,
+  useLoadProjectFromStorage,
+} from "../lib/whiteboard/hooks/useProjectStorage";
+import { useBoardHistory } from "../lib/whiteboard/hooks/useBoardHistory";
+
+// ⬇⬇⬇ 從這裡開始就是你的 Whiteboard 主程式（原本在 WhiteboardNode 後面的程式碼）
+// 例如：const defaultViewport: Viewport = { ... }
+//       function WhiteboardApp() { ... }
+
+
+
+export default function WhiteboardApp() {
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [edges, setEdges] = useState<Edge[]>([]);
+  const [tool, setTool] = useState<Tool>("select");
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
+
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [primaryId, setPrimaryId] = useState<string | null>(null);
+
+  const [connectingFrom, setConnectingFrom] = useState<string | null>(null);
+  const [connectingTo, setConnectingTo] = useState<{ x: number; y: number } | null>(null);
+  const [isConnectDragging, setIsConnectDragging] = useState(false);
+  const [viewport, setViewport] = useState<Viewport>({
+    x: 0,
+    y: 0,
+    scale: 1,
+  });
+  const [projectName, setProjectName] =
+    useState<string>("industry-map-whiteboard");
+
+  // 多頁面
+  const [pages, setPages] = useState<Page[]>([]);
+  const [activePageId, setActivePageId] = useState<string | null>(null);
+
+  const [currentFileName, setCurrentFileName] = useState<string | null>(null);
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+// ---------- 圖片裁切（Crop） ----------
+const [cropModalOpen, setCropModalOpen] = useState(false);
+const [cropTargetId, setCropTargetId] = useState<string | null>(null);
+const [draftCrop, setDraftCrop] = useState<ImageCrop | null>(null);
+const cropDragRef = useRef<
+  | null
+  | {
+      mode: "create" | "move";
+      startX: number;
+      startY: number;
+      // move mode
+      offsetX?: number;
+      offsetY?: number;
+    }
+>(null);
+const cropImgBoxRef = useRef<HTMLDivElement | null>(null);
+
+  const [showLeftPanel, setShowLeftPanel] = useState(true);
+  const [showRightPanel, setShowRightPanel] = useState(true);
+
+  const [leftTab, setLeftTab] = useState<"project" | "templates" | "outline">(
+    "project"
+  );
+
+  const [activeToolbar, setActiveToolbar] = useState<
+    "none" | "file" | "view" | "insert" | "arrange" | "strategy" | "help"
+  >("none");
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
+
+  const [isPanning, setIsPanning] = useState(false);
+  const panStart = useRef<{
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+  } | null>(null);
+
+  const dragStart = useRef<{
+    ids: string[];
+    startWorldX: number;
+    startWorldY: number;
+    nodePositions: Record<string, { x: number; y: number }>;
+  } | null>(null);
+
+  const resizeStart = useRef<{
+    id: string;
+    handle: ResizeHandle;
+    startMouseX: number;
+    startMouseY: number;
+    startX: number;
+    startY: number;
+    startW: number;
+    startH: number;
+  } | null>(null);
+
+  const clipboardRef = useRef<Node[] | null>(null);
+  const spacePressedRef = useRef(false);
+
+  const {
+    recordHistory,
+    undo: handleUndo,
+    redo: handleRedo,
+    historyPastRef,
+    historyFutureRef,
+  } = useBoardHistory({
+    getSnapshot: () => ({
+      nodes: JSON.parse(JSON.stringify(nodes)),
+      edges: JSON.parse(JSON.stringify(edges)),
+      viewport: { ...viewport },
+      projectName,
+    }),
+    applySnapshot: (s) => {
+      setNodes(s.nodes || []);
+      setEdges(s.edges || []);
+      setViewport(s.viewport || { x: 0, y: 0, scale: 1 });
+      setProjectName(s.projectName || "industry-map-whiteboard");
+    },
+    onAfterRestore: () => {
+      setSelectedIds([]);
+      setPrimaryId(null);
+      setEditingId(null);
+    },
+  });
+
+  const [selectionRect, setSelectionRect] = useState<{
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+  } | null>(null);
+  const selectionModeRef = useRef<"replace" | "add" | "subtract">("replace");
+
+  const [snapToGrid, setSnapToGrid] = useState<boolean>(true);
+  const [gridSize] = useState<number>(20);
+
+  const [guideLines, setGuideLines] = useState<{
+    v?: number;
+    h?: number;
+  }>({});
+
+  const [formatPainterActive, setFormatPainterActive] =
+    useState<boolean>(false);
+  const formatSourceIdRef = useRef<string | null>(null);
+
+  // recordHistory / handleUndo / handleRedo 已由 useBoardHistory 提供
+
+  // --------- 初始化 / 自動儲存（抽到 hooks） ----------
+  useLoadProjectFromStorage({
+    setPages,
+    setActivePageId,
+    setNodes,
+    setEdges,
+    setViewport,
+    setProjectName,
+  });
+
+  useAutoSaveProjectToStorage({
+    nodes,
+    edges,
+    viewport,
+    projectName,
+    pages,
+    activePageId,
+    debounceMs: 400,
+  });
+
+  // ---------- 小工具：建立圖片節點 ----------
+  const createImageNodeFromFile = (
+    file: File,
+    worldX: number,
+    worldY: number
+  ) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      const width = 260;
+      const height = 180;
+      const node: Node = {
+        id: createId(),
+        type: "image",
+        x: worldX - width / 2,
+        y: worldY - height / 2,
+        width,
+        height,
+        imageUrl: dataUrl,
+        bgColor: "#ffffff",
+      };
+      recordHistory();
+      setNodes((prev) => [...prev, node]);
+      setSelectedIds([node.id]);
+      setPrimaryId(node.id);
+      setEditingId(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // ---------- 貼上圖片（從剪貼簿） ----------
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      const tag = active?.tagName;
+      const isEditingInput =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        (active && active.isContentEditable);
+      if (isEditingInput) return;
+
+      const items = e.clipboardData?.items;
+      if (!items || !containerRef.current) return;
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (!file) continue;
+
+          e.preventDefault();
+          const rect = containerRef.current.getBoundingClientRect();
+          const localX = rect.width / 2;
+          const localY = rect.height / 2;
+          const worldX = (localX - viewport.x) / viewport.scale;
+          const worldY = (localY - viewport.y) / viewport.scale;
+
+          createImageNodeFromFile(file, worldX, worldY);
+          break;
+        }
+      }
+    };
+
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [viewport]);
+
+// ---------- Connect Tool: 拖曳連線（A/C） ----------
+useEffect(() => {
+  if (tool !== "connect" || !isConnectDragging || !connectingFrom) return;
+
+  const onMove = (e: MouseEvent) => {
+    const p = clientToWorld(e.clientX, e.clientY);
+    setConnectingTo(p);
+  };
+
+  const onUp = (e: MouseEvent) => {
+    const p = clientToWorld(e.clientX, e.clientY);
+
+    // 命中測試：找出滑鼠放開時位於哪個節點上
+    const target = nodes.find((n) => {
+      if (n.id === connectingFrom) return false;
+      return (
+        p.x >= n.x &&
+        p.x <= n.x + n.width &&
+        p.y >= n.y &&
+        p.y <= n.y + n.height
+      );
+    });
+
+    if (target) {
+      const exists = edges.some(
+        (ed) =>
+          (ed.fromId === connectingFrom && ed.toId === target.id) ||
+          (ed.toId === connectingFrom && ed.fromId === target.id)
+      );
+
+      if (!exists) {
+        recordHistory();
+        setEdges((prev) => [
+          ...prev,
+          {
+            id: createId(),
+            fromId: connectingFrom,
+            toId: target.id,
+            relation: "drives",
+            label: "drives",
+          } as any,
+        ]);
+      }
+    }
+
+    setConnectingFrom(null);
+    setConnectingTo(null);
+    setIsConnectDragging(false);
+  };
+
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+
+  return () => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  };
+}, [tool, isConnectDragging, connectingFrom, nodes, edges, viewport]);
+
+  const handleToolClick = (t: Tool) => {
+    setTool(t);
+    setConnectingFrom(null);
+    setEditingId(null);
+  };
+
+  // ---------- Canvas Mouse Down ----------
+  const handleCanvasMouseDown = (e: MouseEvent<HTMLDivElement>) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+
+    // 若正在複製格式，點空白畫布就關閉
+    if (formatPainterActive) {
+      setFormatPainterActive(false);
+      formatSourceIdRef.current = null;
+    }
+
+    const canPan = tool === "pan" || spacePressedRef.current || e.button === 1;
+
+    if (canPan) {
+      e.preventDefault();
+      if (!rect) return;
+      setIsPanning(true);
+      panStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        vx: viewport.x,
+        vy: viewport.y,
+      };
+      setSelectedIds([]);
+      setPrimaryId(null);
+      setConnectingFrom(null);
+      setEditingId(null);
+      return;
+    }
+
+    if (tool === "select" && e.button === 0) {
+      if (!rect) return;
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+      selectionModeRef.current = e.altKey
+        ? "subtract"
+        : e.shiftKey
+        ? "add"
+        : "replace";
+      setSelectionRect({
+        x1: localX,
+        y1: localY,
+        x2: localX,
+        y2: localY,
+      });
+      setEditingId(null);
+      setConnectingFrom(null);
+    } else if (tool === "connect") {
+      setConnectingFrom(null);
+      setSelectedIds([]);
+      setPrimaryId(null);
+      setEditingId(null);
+    }
+  };
+
+  // ---------- Node Mouse Down ----------
+  const handleNodeMouseDown = (
+    e: MouseEvent<HTMLDivElement>,
+    node: Node
+  ) => {
+    e.stopPropagation();
+    const rect = containerRef.current?.getBoundingClientRect();
+
+    // Format Painter 模式：點擊即套用格式
+    if (formatPainterActive && formatSourceIdRef.current) {
+      e.preventDefault();
+      const source = nodes.find((n) => n.id === formatSourceIdRef.current);
+      if (source && source.id !== node.id) {
+        recordHistory();
+        setNodes((prev) =>
+          prev.map((n) =>
+            n.id === node.id
+              ? {
+                  ...n,
+                  bgColor: source.bgColor,
+                  fontSize: source.fontSize,
+                  width: source.width,
+                  height: source.height,
+                }
+              : n
+          )
+        );
+      }
+      setFormatPainterActive(false);
+      formatSourceIdRef.current = null;
+      return;
+    }
+
+    // 中鍵 / Pan / Space
+    if (tool === "pan" || spacePressedRef.current || e.button === 1) {
+      e.preventDefault();
+      if (!rect) return;
+      setIsPanning(true);
+      panStart.current = {
+        x: e.clientX,
+        y: e.clientY,
+        vx: viewport.x,
+        vy: viewport.y,
+      };
+      setSelectedIds([]);
+      setPrimaryId(null);
+      setConnectingFrom(null);
+      setEditingId(null);
+      return;
+    }
+
+    // 鎖定節點：不能拖曳，但可以選取
+    if (node.locked) {
+      if (tool === "select") {
+        let newSelected: string[] = [];
+        if (e.shiftKey) {
+          newSelected = selectedIds.includes(node.id)
+            ? selectedIds
+            : [...selectedIds, node.id];
+        } else if (e.ctrlKey || e.metaKey) {
+          newSelected = selectedIds.includes(node.id)
+            ? selectedIds.filter((id) => id !== node.id)
+            : [...selectedIds, node.id];
+        } else {
+          newSelected = [node.id];
+        }
+        setSelectedIds(newSelected);
+        setPrimaryId(newSelected[0] || null);
+        setEditingId(null);
+      }
+      return;
+    }
+
+    if (tool === "select") {
+      if (!rect) return;
+
+      // 群組點一下選整組
+      let targetIds: string[] = [node.id];
+      if (node.groupId) {
+        const groupNodes = nodes.filter((n) => n.groupId === node.groupId);
+        if (groupNodes.length > 1) {
+          targetIds = groupNodes.map((n) => n.id);
+        }
+      }
+
+      let newSelected: string[] = [];
+      if (e.shiftKey) {
+        const merged = new Set([...selectedIds, ...targetIds]);
+        newSelected = Array.from(merged);
+      } else if (e.ctrlKey || e.metaKey) {
+        const set = new Set(selectedIds);
+        targetIds.forEach((id) => {
+          if (set.has(id)) set.delete(id);
+          else set.add(id);
+        });
+        newSelected = Array.from(set);
+      } else {
+        newSelected = targetIds;
+      }
+
+      setSelectedIds(newSelected);
+      setPrimaryId(newSelected[0] || null);
+      setEditingId(null);
+      setConnectingFrom(null);
+
+      // Ctrl / Alt 拖曳複製
+      const shouldClone = e.ctrlKey || e.metaKey || e.altKey;
+      const effectiveIds = newSelected.filter((id) => {
+        const n = nodes.find((nn) => nn.id === id);
+        return n && !n.locked;
+      });
+
+      recordHistory();
+
+      let dragIds = effectiveIds;
+      if (shouldClone && effectiveIds.length) {
+        const clones: Node[] = [];
+        effectiveIds.forEach((id) => {
+          const original = nodes.find((n) => n.id === id);
+          if (!original) return;
+          const newId = createId();
+          clones.push({
+            ...JSON.parse(JSON.stringify(original)),
+            id: newId,
+            x: original.x + 20,
+            y: original.y + 20,
+          });
+        });
+        setNodes((prev) => [...prev, ...clones]);
+        dragIds = clones.map((n) => n.id);
+        setSelectedIds(dragIds);
+        setPrimaryId(dragIds[0] || null);
+      }
+
+      if (!rect) return;
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+      const worldX = (localX - viewport.x) / viewport.scale;
+      const worldY = (localY - viewport.y) / viewport.scale;
+
+      const pos: Record<string, { x: number; y: number }> = {};
+      nodes.forEach((n) => {
+        if (dragIds.includes(n.id)) {
+          pos[n.id] = { x: n.x, y: n.y };
+        }
+      });
+
+      dragStart.current = {
+        ids: dragIds,
+        startWorldX: worldX,
+        startWorldY: worldY,
+        nodePositions: pos,
+      };
+    } else if (tool === "connect") {
+      setEditingId(null);
+      if (!connectingFrom) {
+        setConnectingFrom(node.id);
+        setSelectedIds([node.id]);
+        setPrimaryId(node.id);
+        // 進入拖曳連線模式：按住滑鼠拖到另一個節點放開即可建立 Edge
+        const p = clientToWorld(e.clientX, e.clientY);
+        setConnectingTo(p);
+        setIsConnectDragging(true);
+      } else if (connectingFrom === node.id) {
+        setConnectingFrom(null);
+      } else {
+        const exists = edges.some(
+          (ed) =>
+            (ed.fromId === connectingFrom && ed.toId === node.id) ||
+            (ed.toId === connectingFrom && ed.fromId === node.id)
+        );
+        if (!exists) {
+          recordHistory();
+          setEdges((prev) => [
+            ...prev,
+            { id: createId(), fromId: connectingFrom, toId: node.id },
+          ]);
+        }
+        setConnectingFrom(null);
+      }
+    }
+  };
+
+  // ---------- Resize Handle Mouse Down ----------
+  const handleResizeHandleMouseDown = (
+    e: MouseEvent<HTMLDivElement>,
+    node: Node,
+    handle: ResizeHandle
+  ) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || node.locked) return;
+
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+
+    recordHistory();
+    resizeStart.current = {
+      id: node.id,
+      handle,
+      startMouseX: localX,
+      startMouseY: localY,
+      startX: node.x,
+      startY: node.y,
+      startW: node.width,
+      startH: node.height,
+    };
+  };
+
+  // ---------- Canvas Mouse Move ----------
+  const handleCanvasMouseMove = (e: MouseEvent<HTMLDivElement>) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+
+    // 矩形框選中
+    if (selectionRect) {
+      setSelectionRect((prev) =>
+        prev ? { ...prev, x2: localX, y2: localY } : prev
+      );
+      return;
+    }
+
+    // Resize
+    const rs = resizeStart.current;
+    if (rs) {
+      const dxWorld = (localX - rs.startMouseX) / viewport.scale;
+      const dyWorld = (localY - rs.startMouseY) / viewport.scale;
+
+      setNodes((prev) =>
+        prev.map((n) => {
+          if (n.id !== rs.id) return n;
+          let { x, y, width, height } = n;
+          const minW = 40;
+          const minH = 30;
+
+          switch (rs.handle) {
+            case "right":
+              width = Math.max(minW, rs.startW + dxWorld);
+              break;
+            case "left":
+              width = Math.max(minW, rs.startW - dxWorld);
+              x = rs.startX + (rs.startW - width);
+              break;
+            case "bottom":
+              height = Math.max(minH, rs.startH + dyWorld);
+              break;
+            case "top":
+              height = Math.max(minH, rs.startH - dyWorld);
+              y = rs.startY + (rs.startH - height);
+              break;
+            case "top-left": {
+              width = Math.max(minW, rs.startW - dxWorld);
+              height = Math.max(minH, rs.startH - dyWorld);
+              x = rs.startX + (rs.startW - width);
+              y = rs.startY + (rs.startH - height);
+              break;
+            }
+            case "top-right": {
+              width = Math.max(minW, rs.startW + dxWorld);
+              height = Math.max(minH, rs.startH - dyWorld);
+              y = rs.startY + (rs.startH - height);
+              break;
+            }
+            case "bottom-left": {
+              width = Math.max(minW, rs.startW - dxWorld);
+              height = Math.max(minH, rs.startH + dyWorld);
+              x = rs.startX + (rs.startW - width);
+              break;
+            }
+            case "bottom-right": {
+              width = Math.max(minW, rs.startW + dxWorld);
+              height = Math.max(minH, rs.startH + dyWorld);
+              break;
+            }
+          }
+
+          return { ...n, x, y, width, height };
+        })
+      );
+      return;
+    }
+
+    // 平移
+    if (isPanning && panStart.current) {
+      const ps = panStart.current;
+      const dx = e.clientX - ps.x;
+      const dy = e.clientY - ps.y;
+      setViewport((v) => ({
+        ...v,
+        x: ps.vx + dx,
+        y: ps.vy + dy,
+      }));
+      return;
+    }
+
+    // 拖曳節點群 + Smart Guide
+    const ds = dragStart.current;
+    if (ds && tool === "select") {
+      const worldX = (localX - viewport.x) / viewport.scale;
+      const worldY = (localY - viewport.y) / viewport.scale;
+
+      let dx = worldX - ds.startWorldX;
+      let dy = worldY - ds.startWorldY;
+
+      // Snap to Grid：以主節點當基準
+      if (snapToGrid) {
+        const mainId = primaryId || ds.ids[0];
+        const basePos = ds.nodePositions[mainId];
+        if (basePos) {
+          const newX = basePos.x + dx;
+          const newY = basePos.y + dy;
+          const snappedX = Math.round(newX / gridSize) * gridSize;
+          const snappedY = Math.round(newY / gridSize) * gridSize;
+          dx = snappedX - basePos.x;
+          dy = snappedY - basePos.y;
+        }
+      }
+
+      // Smart Guides
+      setGuideLines({});
+      const movingIds = new Set(ds.ids);
+      const mainId = primaryId || ds.ids[0];
+      const mainNode = nodes.find((n) => n.id === mainId);
+      if (mainNode) {
+        const movingCenterX = mainNode.x + mainNode.width / 2 + dx;
+        const movingCenterY = mainNode.y + mainNode.height / 2 + dy;
+
+        let bestVX: number | null = null;
+        let bestVDiff = Number.POSITIVE_INFINITY;
+        let bestHY: number | null = null;
+        let bestHDiff = Number.POSITIVE_INFINITY;
+
+        const threshold = 6 / viewport.scale;
+
+        nodes.forEach((n) => {
+          if (movingIds.has(n.id)) return;
+          const cx = n.x + n.width / 2;
+          const cy = n.y + n.height / 2;
+
+          const diffX = Math.abs(cx - movingCenterX);
+          if (diffX < threshold && diffX < bestVDiff) {
+            bestVDiff = diffX;
+            bestVX = cx;
+          }
+
+          const diffY = Math.abs(cy - movingCenterY);
+          if (diffY < threshold && diffY < bestHDiff) {
+            bestHDiff = diffY;
+            bestHY = cy;
+          }
+        });
+
+        if (bestVX !== null) {
+          const offsetX = bestVX - movingCenterX;
+          dx += offsetX;
+          setGuideLines((prev) => ({ ...prev, v: bestVX as number }));
+        }
+
+        if (bestHY !== null) {
+          const offsetY = bestHY - movingCenterY;
+          dy += offsetY;
+          setGuideLines((prev) => ({ ...prev, h: bestHY as number }));
+        }
+      }
+
+      setNodes((prev) =>
+        prev.map((n) => {
+          if (!ds.ids.includes(n.id)) return n;
+          const base = ds.nodePositions[n.id];
+          if (!base) return n;
+          return {
+            ...n,
+            x: base.x + dx,
+            y: base.y + dy,
+          };
+        })
+      );
+      return;
+    }
+  };
+
+  // ---------- Mouse Up ----------
+  const handleCanvasMouseUp = () => {
+    setIsPanning(false);
+    panStart.current = null;
+    dragStart.current = null;
+    resizeStart.current = null;
+    setGuideLines({});
+
+    // 矩形框選結束
+    if (selectionRect && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const { x1, y1, x2, y2 } = selectionRect;
+      const rx1 = Math.min(x1, x2);
+      const ry1 = Math.min(y1, y2);
+      const rx2 = Math.max(x1, x2);
+      const ry2 = Math.max(y1, y2);
+
+      const includedIds: string[] = [];
+      nodes.forEach((n) => {
+        const sx1 = n.x * viewport.scale + viewport.x;
+        const sy1 = n.y * viewport.scale + viewport.y;
+        const sx2 = (n.x + n.width) * viewport.scale + viewport.x;
+        const sy2 = (n.y + n.height) * viewport.scale + viewport.y;
+        const intersect =
+          sx2 >= rx1 && sx1 <= rx2 && sy2 >= ry1 && sy1 <= ry2;
+        if (intersect) includedIds.push(n.id);
+      });
+
+      let newSelected: string[] = [];
+      if (selectionModeRef.current === "add") {
+        const set = new Set([...selectedIds, ...includedIds]);
+        newSelected = Array.from(set);
+      } else if (selectionModeRef.current === "subtract") {
+        const set = new Set(selectedIds);
+        includedIds.forEach((id) => set.delete(id));
+        newSelected = Array.from(set);
+      } else {
+        newSelected = includedIds;
+      }
+
+      setSelectedIds(newSelected);
+      setPrimaryId(newSelected[0] || null);
+      setSelectionRect(null);
+    }
+  };
+
+  // ---------- 滾輪縮放 ----------
+  const handleWheel = (e: WheelEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = containerRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const delta = -e.deltaY;
+    const zoomFactor = delta > 0 ? 1.1 : 1 / 1.1;
+
+    setViewport((v) => {
+      const newScale = Math.min(3, Math.max(0.2, v.scale * zoomFactor));
+      const worldX = (mx - v.x) / v.scale;
+      const worldY = (my - v.y) / v.scale;
+      const newX = mx - worldX * newScale;
+      const newY = my - worldY * newScale;
+      return { x: newX, y: newY, scale: newScale };
+    });
+  };
+
+  // ---------- Fit to Content ----------
+  const handleFitToContent = () => {
+    if (!containerRef.current || nodes.length === 0) {
+      setViewport({ x: 0, y: 0, scale: 1 });
+      return;
+    }
+    const rect = containerRef.current.getBoundingClientRect();
+    const padding = 80;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    nodes.forEach((n) => {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.width);
+      maxY = Math.max(maxY, n.y + n.height);
+    });
+    const contentWidth = maxX - minX || 1;
+    const contentHeight = maxY - minY || 1;
+    const scaleX = (rect.width - padding * 2) / contentWidth;
+    const scaleY = (rect.height - padding * 2) / contentHeight;
+    const scale = Math.max(0.2, Math.min(3, Math.min(scaleX, scaleY)));
+    const screenContentWidth = contentWidth * scale;
+    const screenContentHeight = contentHeight * scale;
+    const offsetX = (rect.width - screenContentWidth) / 2;
+    const offsetY = (rect.height - screenContentHeight) / 2;
+    const x = offsetX - minX * scale;
+    const y = offsetY - minY * scale;
+    setViewport({ x, y, scale });
+  };
+
+  // ---------- 文字 / 表格 ----------
+  const handleDoubleClickNode = (node: Node) => {
+    if (node.type === "image" || node.type === "table" || node.locked) return;
+    setSelectedIds([node.id]);
+    setPrimaryId(node.id);
+    setEditingId(node.id);
+  };
+
+  const handleInlineTextChange = (id: string, value: string) => {
+    setNodes((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, text: value } : n))
+    );
+  };
+
+  const handleFinishEditing = () => {
+    setEditingId(null);
+  };
+
+  const handleTableCellChange = (
+    nodeId: string,
+    row: number,
+    col: number,
+    value: string
+  ) => {
+    setNodes((prev) =>
+      prev.map((n) => {
+        if (n.id !== nodeId || !n.table) return n;
+        const newCells = n.table.cells.map((r, ri) =>
+          ri === row
+            ? r.map((c, ci) => (ci === col ? value : c))
+            : r
+        );
+        return {
+          ...n,
+          table: {
+            ...n.table,
+            cells: newCells,
+          },
+        };
+      })
+    );
+  };
+
+  const updateTableSize = (nodeId: string, rows: number, cols: number) => {
+    const r = Math.max(1, Math.min(50, Math.floor(rows || 0)));
+    const c = Math.max(1, Math.min(50, Math.floor(cols || 0)));
+    recordHistory();
+    setNodes((prev) =>
+      prev.map((n) => {
+        if (n.id !== nodeId || !n.table) return n;
+        const old = n.table;
+        const newCells = Array.from({ length: r }, (_, ri) =>
+          Array.from({ length: c }, (_, ci) => old.cells[ri]?.[ci] ?? "")
+        );
+        return {
+          ...n,
+          table: {
+            rows: r,
+            cols: c,
+            cells: newCells,
+          },
+        };
+      })
+    );
+  };
+
+  // ---------- 新增節點 ----------
+  const addNodeAtCenter = (type: NodeType) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const localX = rect.width / 2;
+    const localY = rect.height / 2;
+    const worldX = (localX - viewport.x) / viewport.scale;
+    const worldY = (localY - viewport.y) / viewport.scale;
+
+    let width = 220;
+    let height = 140;
+    let text = "";
+    let fontSize = 12;
+    let level: StrategyLevel | undefined = "L2";
+
+    if (type === "category") {
+      width = 260;
+      height = 140;
+      text = "未命名分類";
+      fontSize = 14;
+      level = "L1";
+    } else if (type === "note") {
+      text = "便利貼";
+      level = "Info";
+    } else if (type === "text") {
+      text = "文字";
+      level = "L3";
+    }
+
+    const node: Node = {
+      id: createId(),
+      type,
+      x: worldX - width / 2,
+      y: worldY - height / 2,
+      width,
+      height,
+      text,
+      bgColor: type === "note" ? "#fef9c3" : "#ffffff",
+      fontSize,
+      level,
+    };
+
+    if (type === "table") {
+      const rows = 3;
+      const cols = 3;
+      node.table = {
+        rows,
+        cols,
+        cells: Array.from({ length: rows }, () =>
+          Array.from({ length: cols }, () => "")
+        ),
+      };
+      node.fontSize = 10;
+      node.level = "L3";
+    }
+
+    recordHistory();
+    setNodes((prev) => [...prev, node]);
+    setSelectedIds([node.id]);
+    setPrimaryId(node.id);
+    setEditingId(null);
+  };
+
+  // ---------- Drag & Drop 圖片 ----------
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+
+    const file = e.dataTransfer.files?.[0];
+    if (!file || !file.type.startsWith("image/")) return;
+
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const worldX = (localX - viewport.x) / viewport.scale;
+    const worldY = (localY - viewport.y) / viewport.scale;
+
+    createImageNodeFromFile(file, worldX, worldY);
+  };
+
+  // ---------- 匯出 PNG ----------
+  const handleExportPng = async () => {
+    if (!containerRef.current) return;
+    if (!nodes.length) {
+      alert("目前沒有節點可以匯出");
+      return;
+    }
+
+    const rect = containerRef.current.getBoundingClientRect();
+    const padding = 80;
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    nodes.forEach((n) => {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.width);
+      maxY = Math.max(maxY, n.y + n.height);
+    });
+    const contentWidth = maxX - minX || 1;
+    const contentHeight = maxY - minY || 1;
+    const scaleX = (rect.width - padding * 2) / contentWidth;
+    const scaleY = (rect.height - padding * 2) / contentHeight;
+    const scale = Math.max(0.2, Math.min(3, Math.min(scaleX, scaleY)));
+    const screenContentWidth = contentWidth * scale;
+    const screenContentHeight = contentHeight * scale;
+    const offsetX = (rect.width - screenContentWidth) / 2;
+    const offsetY = (rect.height - screenContentHeight) / 2;
+    const x = offsetX - minX * scale;
+    const y = offsetY - minY * scale;
+    const oldViewport = viewport;
+    const newViewport: Viewport = { x, y, scale };
+    setViewport(newViewport);
+
+    setTimeout(async () => {
+      try {
+        if (!containerRef.current) return;
+        const canvas = await html2canvas(containerRef.current, {
+          backgroundColor: "#e5e7eb",
+          scale: 2,
+        });
+        const url = canvas.toDataURL("image/png");
+        const a = document.createElement("a");
+        const safeName =
+          projectName && projectName.trim().length > 0
+            ? projectName.trim()
+            : "industry-map-whiteboard";
+        a.href = url;
+        a.download = `${safeName}.png`;
+        a.click();
+      } finally {
+        setViewport(oldViewport);
+      }
+    }, 200);
+  };
+
+  // ---------- 匯出 .lmwb（多頁面） ----------
+  const handleExportLmwb = async (isSaveAs: boolean) => {
+    try {
+      const zip = new JSZip();
+
+      const pagesForSave: Page[] = pages.map((p) =>
+        p.id === activePageId
+          ? {
+              ...p,
+              nodes: JSON.parse(JSON.stringify(nodes)),
+              edges: JSON.parse(JSON.stringify(edges)),
+              viewport: { ...viewport },
+            }
+          : p
+      );
+
+      const project: ProjectFileV2 = {
+        version: 2,
+        projectName,
+        activePageId,
+        pages: pagesForSave,
+      };
+
+      // 為 image node 指定 imageFile 路徑
+      const imageDir = "images";
+      project.pages.forEach((page, pi) => {
+        page.nodes.forEach((n, idx) => {
+          if (n.type === "image") {
+            n.imageFile =
+              n.imageFile || `${imageDir}/p${pi}_img_${idx}_${n.id}.png`;
+          }
+        });
+      });
+
+      zip.file("project.json", JSON.stringify(project, null, 2));
+
+      // 所有圖片塞進 ZIP
+      const imgTasks: Promise<void>[] = [];
+      project.pages.forEach((page) => {
+        page.nodes.forEach((n) => {
+          if (n.type === "image" && n.imageFile && n.imageUrl) {
+            const fileName = n.imageFile as string;
+            const url = n.imageUrl as string;
+            if (url.startsWith("data:")) {
+              const base64 = url.split(",")[1];
+              zip.file(fileName, base64, { base64: true });
+            } else {
+              const task = fetch(url)
+                .then((res) => res.blob())
+                .then((blob) => blob.arrayBuffer())
+                .then((buf) => {
+                  zip.file(fileName, buf);
+                })
+                .catch(() => {
+                  // ignore fetch error
+                });
+              imgTasks.push(task);
+            }
+          }
+        });
+      });
+
+      await Promise.all(imgTasks);
+      const blob = await zip.generateAsync({ type: "blob" });
+
+      const a = document.createElement("a");
+      const baseName =
+        !isSaveAs && currentFileName
+          ? currentFileName.replace(/\.lmwb$/i, "")
+          : projectName && projectName.trim().length > 0
+          ? projectName.trim()
+          : "industry-map-whiteboard";
+      const fileName = `${baseName}.lmwb`;
+      setCurrentFileName(fileName);
+
+      a.href = URL.createObjectURL(blob);
+      a.download = fileName;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) {
+      console.error(err);
+      alert(".lmwb 匯出失敗");
+    }
+  };
+
+  // ---------- 匯入 .lmwb / JSON（多頁相容） ----------
+  const handleImportChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const ext = file.name.split(".").pop()?.toLowerCase();
+
+    if (ext === "lmwb") {
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const zip = await JSZip.loadAsync(reader.result as ArrayBuffer);
+          const projectEntry = zip.file("project.json");
+          if (!projectEntry) {
+            alert("此 .lmwb 檔缺少 project.json");
+            return;
+          }
+          const text = await projectEntry.async("text");
+          const parsed = JSON.parse(text);
+
+          if (parsed && Array.isArray(parsed.pages)) {
+            // 新版 v2 結構
+            const proj = parsed as ProjectFileV2;
+            const restoredPages: Page[] = [];
+            for (const page of proj.pages || []) {
+              const restoredNodes: Node[] = [];
+              for (const n of page.nodes || []) {
+                const nodeCopy: Node = { ...n };
+                if (
+                  nodeCopy.type === "image" &&
+                  nodeCopy.imageFile &&
+                  !nodeCopy.imageUrl
+                ) {
+                  const fileObj = zip.file(nodeCopy.imageFile);
+                  if (fileObj) {
+                    const base64 = await fileObj.async("base64");
+                    nodeCopy.imageUrl = `data:image/png;base64,${base64}`;
+                  }
+                }
+                restoredNodes.push(nodeCopy);
+              }
+
+              restoredPages.push({
+                id: page.id || createId(),
+                name: page.name || "Untitled Page",
+                nodes: restoredNodes,
+                edges: page.edges || [],
+                viewport: page.viewport || { x: 0, y: 0, scale: 1 },
+              });
+            }
+
+            setPages(restoredPages);
+            const activeId =
+              proj.activePageId ||
+              restoredPages[0]?.id ||
+              null;
+            setActivePageId(activeId);
+            const activePage =
+              restoredPages.find((p) => p.id === activeId) ||
+              restoredPages[0];
+
+            if (activePage) {
+              recordHistory();
+              setNodes(activePage.nodes || []);
+              setEdges(activePage.edges || []);
+              setViewport(
+                activePage.viewport || { x: 0, y: 0, scale: 1 }
+              );
+            } else {
+              setNodes([]);
+              setEdges([]);
+              setViewport({ x: 0, y: 0, scale: 1 });
+            }
+
+            setProjectName(
+              proj.projectName || file.name.replace(/\.lmwb$/i, "")
+            );
+            setCurrentFileName(file.name);
+            setSelectedIds([]);
+            setPrimaryId(null);
+            setEditingId(null);
+            alert("已從 .lmwb 專案檔匯入（多頁＋圖片）");
+          } else if (parsed && Array.isArray(parsed.nodes)) {
+            // 舊版 BoardState
+            const legacy = parsed as BoardState;
+            const defaultPageId = createId();
+            const page: Page = {
+              id: defaultPageId,
+              name: "Page 1",
+              nodes: legacy.nodes || [],
+              edges: legacy.edges || [],
+              viewport:
+                legacy.viewport || { x: 0, y: 0, scale: 1 },
+            };
+            setPages([page]);
+            setActivePageId(defaultPageId);
+            setNodes(page.nodes);
+            setEdges(page.edges);
+            setViewport(page.viewport);
+            setProjectName(
+              legacy.projectName || file.name.replace(/\.lmwb$/i, "")
+            );
+            setCurrentFileName(file.name);
+            setSelectedIds([]);
+            setPrimaryId(null);
+            setEditingId(null);
+            alert("已匯入舊版 .lmwb（單一頁面）");
+          } else {
+            alert("project.json 格式錯誤，無法匯入");
+          }
+        } catch (err) {
+          console.error(err);
+          alert(".lmwb 匯入失敗：檔案內容錯誤或已損毀");
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      // 舊版 JSON
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const text = reader.result as string;
+          const parsed = JSON.parse(text);
+          if (parsed && Array.isArray(parsed.pages)) {
+            const proj = parsed as ProjectFileV2;
+            setPages(proj.pages || []);
+            const activeId =
+              proj.activePageId ||
+              proj.pages?.[0]?.id ||
+              null;
+            setActivePageId(activeId);
+            const activePage =
+              proj.pages?.find((p) => p.id === activeId) ||
+              proj.pages?.[0];
+
+            if (activePage) {
+              setNodes(activePage.nodes || []);
+              setEdges(activePage.edges || []);
+              setViewport(
+                activePage.viewport || { x: 0, y: 0, scale: 1 }
+              );
+            } else {
+              setNodes([]);
+              setEdges([]);
+              setViewport({ x: 0, y: 0, scale: 1 });
+            }
+
+            setProjectName(
+              proj.projectName || "未命名專案"
+            );
+            setCurrentFileName(file.name.replace(/\.(json)$/i, "") + ".lmwb");
+          } else if (parsed && Array.isArray(parsed.nodes)) {
+            const legacy = parsed as BoardState;
+            const defaultPageId = createId();
+            const page: Page = {
+              id: defaultPageId,
+              name: "Page 1",
+              nodes: legacy.nodes || [],
+              edges: legacy.edges || [],
+              viewport:
+                legacy.viewport || { x: 0, y: 0, scale: 1 },
+            };
+            setPages([page]);
+            setActivePageId(defaultPageId);
+            setNodes(page.nodes);
+            setEdges(page.edges);
+            setViewport(page.viewport);
+            setProjectName(
+              legacy.projectName || "未命名專案"
+            );
+            setCurrentFileName(
+              file.name.replace(/\.(json)$/i, "") + ".lmwb"
+            );
+            alert("已從 JSON 匯入（單一頁面），建議改用 .lmwb 以保存圖片");
+          } else {
+            alert("匯入失敗：檔案內容不是有效 JSON");
+          }
+        } catch {
+          alert("匯入失敗：檔案內容不是有效 JSON");
+        }
+      };
+      reader.readAsText(file);
+    }
+    e.target.value = "";
+  };
+
+  // ---------- 屬性面板操作 ----------
+  const selectedNodes = nodes.filter((n) => selectedIds.includes(n.id));
+  const selectedNode = selectedNodes[0] || null;
+
+  const updateSelectedNode = (partial: Partial<Node>) => {
+    if (!selectedNode) return;
+    const ids = selectedIds.length ? selectedIds : [selectedNode.id];
+    setNodes((prev) =>
+      prev.map((n) =>
+        ids.includes(n.id) ? { ...n, ...partial } : n
+      )
+    );
+  };
+
+const openCropModalForSelected = () => {
+  if (!selectedNode || selectedNode.type !== "image" || selectedNode.locked) return;
+  if (!selectedNode.imageUrl) return;
+  setCropTargetId(selectedNode.id);
+  // 若沒有裁切，就先給一個預設框（置中 80%）
+  const c = selectedNode.imageCrop;
+  if (c) {
+    setDraftCrop({ ...c });
+  } else {
+    setDraftCrop({ x: 0.1, y: 0.1, w: 0.8, h: 0.8 });
+  }
+  setCropModalOpen(true);
+};
+
+const resetCropForSelected = () => {
+  if (!selectedNode || selectedNode.type !== "image") return;
+  updateSelectedNode({ imageCrop: undefined });
+};
+
+const applyDraftCrop = () => {
+  if (!cropTargetId) return;
+  const c = draftCrop;
+  // 全圖視為未裁切
+  const isFull =
+    !c ||
+    (Math.abs(c.x) < 1e-6 &&
+      Math.abs(c.y) < 1e-6 &&
+      Math.abs(c.w - 1) < 1e-6 &&
+      Math.abs(c.h - 1) < 1e-6);
+
+  setNodes((prev) =>
+    prev.map((n) =>
+      n.id === cropTargetId
+        ? { ...n, imageCrop: isFull ? undefined : c! }
+        : n
+    )
+  );
+  recordHistory();
+  setCropModalOpen(false);
+  setCropTargetId(null);
+  setDraftCrop(null);
+  cropDragRef.current = null;
+};
+
+const closeCropModal = () => {
+  setCropModalOpen(false);
+  setCropTargetId(null);
+  setDraftCrop(null);
+  cropDragRef.current = null;
+};
+
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+const clampCrop = (c: ImageCrop): ImageCrop => {
+  const x = clamp01(c.x);
+  const y = clamp01(c.y);
+  const w = clamp01(c.w);
+  const h = clamp01(c.h);
+  // 確保 w/h 不為 0，並且不超出 1
+  const minSize = 0.02;
+  const ww = Math.max(minSize, Math.min(w, 1 - x));
+  const hh = Math.max(minSize, Math.min(h, 1 - y));
+  return { x, y, w: ww, h: hh };
+};
+
+const getCropBoxMetrics = () => {
+  const el = cropImgBoxRef.current;
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { left: r.left, top: r.top, width: r.width, height: r.height };
+};
+
+const pointToNorm = (clientX: number, clientY: number) => {
+  const m = getCropBoxMetrics();
+  if (!m) return null;
+  const nx = (clientX - m.left) / m.width;
+  const ny = (clientY - m.top) / m.height;
+  return { x: clamp01(nx), y: clamp01(ny) };
+};
+
+const isPointInCrop = (p: { x: number; y: number }, c: ImageCrop) => {
+  return p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h;
+};
+
+const onCropMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const p = pointToNorm(e.clientX, e.clientY);
+  if (!p) return;
+
+  if (draftCrop && isPointInCrop(p, draftCrop)) {
+    // move
+    cropDragRef.current = {
+      mode: "move",
+      startX: p.x,
+      startY: p.y,
+      offsetX: p.x - draftCrop.x,
+      offsetY: p.y - draftCrop.y,
+    };
+  } else {
+    // create
+    cropDragRef.current = { mode: "create", startX: p.x, startY: p.y };
+    setDraftCrop({ x: p.x, y: p.y, w: 0.001, h: 0.001 });
+  }
+};
+
+const onCropMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+  const drag = cropDragRef.current;
+  if (!drag) return;
+  const p = pointToNorm(e.clientX, e.clientY);
+  if (!p) return;
+
+  if (drag.mode === "create") {
+    const x1 = drag.startX;
+    const y1 = drag.startY;
+    const x2 = p.x;
+    const y2 = p.y;
+    const x = Math.min(x1, x2);
+    const y = Math.min(y1, y2);
+    const w = Math.abs(x2 - x1);
+    const h = Math.abs(y2 - y1);
+    setDraftCrop(clampCrop({ x, y, w, h }));
+  } else {
+    // move
+    if (!draftCrop) return;
+    const nx = p.x - (drag.offsetX ?? 0);
+    const ny = p.y - (drag.offsetY ?? 0);
+    setDraftCrop(clampCrop({ x: nx, y: ny, w: draftCrop.w, h: draftCrop.h }));
+  }
+};
+
+const onCropMouseUp = () => {
+  cropDragRef.current = null;
+};
+
+  const deleteSelectedNode = () => {
+    if (!selectedIds.length) return;
+    recordHistory();
+    setNodes((prev) =>
+      prev.filter((n) => !selectedIds.includes(n.id))
+    );
+    setEdges((prev) =>
+      prev.filter(
+        (e) =>
+          !selectedIds.includes(e.fromId) &&
+          !selectedIds.includes(e.toId)
+      )
+    );
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  // ---------- Copy / Paste ----------
+  const copySelectedNode = () => {
+    if (!selectedNodes.length) return;
+    clipboardRef.current = JSON.parse(JSON.stringify(selectedNodes));
+  };
+
+  const pasteNodeFromClipboard = () => {
+    const data = clipboardRef.current;
+    if (!data || !data.length) return;
+    recordHistory();
+    const cloned: Node[] = data.map((orig) => ({
+      ...JSON.parse(JSON.stringify(orig)),
+      id: createId(),
+      x: orig.x + 30,
+      y: orig.y + 30,
+    }));
+    setNodes((prev) => [...prev, ...cloned]);
+    const ids = cloned.map((n) => n.id);
+    setSelectedIds(ids);
+    setPrimaryId(ids[0] || null);
+    setEditingId(null);
+  };
+
+  // ---------- 對齊 / 分佈 / 同寬高 ----------
+  const alignSelected = (
+    mode:
+      | "left"
+      | "right"
+      | "top"
+      | "bottom"
+      | "centerX"
+      | "centerY"
+  ) => {
+    if (selectedIds.length < 2) return;
+    recordHistory();
+    setNodes((prev) => {
+      const selected = prev.filter((n) => selectedIds.includes(n.id));
+      let minX = Infinity,
+        maxX = -Infinity,
+        minY = Infinity,
+        maxY = -Infinity;
+      selected.forEach((n) => {
+        minX = Math.min(minX, n.x);
+        maxX = Math.max(maxX, n.x + n.width);
+        minY = Math.min(minY, n.y);
+        maxY = Math.max(maxY, n.y + n.height);
+      });
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+
+      return prev.map((n) => {
+        if (!selectedIds.includes(n.id)) return n;
+        switch (mode) {
+          case "left":
+            return { ...n, x: minX };
+          case "right":
+            return { ...n, x: maxX - n.width };
+          case "top":
+            return { ...n, y: minY };
+          case "bottom":
+            return { ...n, y: maxY - n.height };
+          case "centerX": {
+            const cx = centerX;
+            return { ...n, x: cx - n.width / 2 };
+          }
+          case "centerY": {
+            const cy = centerY;
+            return { ...n, y: cy - n.height / 2 };
+          }
+        }
+      });
+    });
+  };
+
+  const distributeSelected = (direction: "horizontal" | "vertical") => {
+    if (selectedIds.length < 3) return;
+    recordHistory();
+    setNodes((prev) => {
+      const selected = prev
+        .filter((n) => selectedIds.includes(n.id))
+        .sort((a, b) =>
+          direction === "horizontal" ? a.x - b.x : a.y - b.y
+        );
+      if (selected.length < 3) return prev;
+      const first = selected[0];
+      const last = selected[selected.length - 1];
+
+      if (direction === "horizontal") {
+        const firstCenter = first.x + first.width / 2;
+        const lastCenter = last.x + last.width / 2;
+        const step =
+          (lastCenter - firstCenter) / (selected.length - 1);
+        return prev.map((n) => {
+          const idx = selected.findIndex((s) => s.id === n.id);
+          if (idx === -1) return n;
+          if (idx === 0 || idx === selected.length - 1) return n;
+          const cx = firstCenter + step * idx;
+          return { ...n, x: cx - n.width / 2 };
+        });
+      } else {
+        const firstCenter = first.y + first.height / 2;
+        const lastCenter = last.y + last.height / 2;
+        const step =
+          (lastCenter - firstCenter) / (selected.length - 1);
+        return prev.map((n) => {
+          const idx = selected.findIndex((s) => s.id === n.id);
+          if (idx === -1) return n;
+          if (idx === 0 || idx === selected.length - 1) return n;
+          const cy = firstCenter + step * idx;
+          return { ...n, y: cy - n.height / 2 };
+        });
+      }
+    });
+  };
+
+  const matchSizeSelected = (mode: "width" | "height" | "both") => {
+    if (selectedIds.length < 2) return;
+    const baseId = primaryId || selectedIds[0];
+    const base = nodes.find((n) => n.id === baseId);
+    if (!base) return;
+    recordHistory();
+    setNodes((prev) =>
+      prev.map((n) => {
+        if (!selectedIds.includes(n.id) || n.id === baseId) return n;
+        if (mode === "width") return { ...n, width: base.width };
+        if (mode === "height") return { ...n, height: base.height };
+        return { ...n, width: base.width, height: base.height };
+      })
+    );
+  };
+
+  // ---------- 群組 ----------
+  const createGroupForSelected = () => {
+    if (selectedIds.length < 2) return;
+    const gid = createId();
+    recordHistory();
+    setNodes((prev) =>
+      prev.map((n) =>
+        selectedIds.includes(n.id) ? { ...n, groupId: gid } : n
+      )
+    );
+  };
+
+  const ungroupSelected = () => {
+    if (!selectedIds.length) return;
+    recordHistory();
+    setNodes((prev) =>
+      prev.map((n) =>
+        selectedIds.includes(n.id) ? { ...n, groupId: undefined } : n
+      )
+    );
+  };
+
+  // ---------- Keyboard Shortcut ----------
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      const tag = active?.tagName;
+      const isEditingInput =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        (active && active.isContentEditable);
+
+      const key = e.key.toLowerCase();
+
+      // Esc：關閉複製格式與編輯
+      if (key === "escape") {
+        if (formatPainterActive) {
+          setFormatPainterActive(false);
+          formatSourceIdRef.current = null;
+        }
+        setEditingId(null);
+        return;
+      }
+
+      if (
+        isEditingInput &&
+        (key === "c" || key === "v" || key === "z" || key === "y")
+      ) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && key === "y") {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
+      if (e.code === "Space") {
+        if (!spacePressedRef.current) {
+          spacePressedRef.current = true;
+        }
+      }
+
+      if ((e.ctrlKey || e.metaKey) && key === "c") {
+        e.preventDefault();
+        copySelectedNode();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && key === "v") {
+        if (clipboardRef.current) {
+          e.preventDefault();
+          pasteNodeFromClipboard();
+          return;
+        }
+      }
+
+      if ((e.ctrlKey || e.metaKey) && key === "a") {
+        e.preventDefault();
+        const allIds = nodes.map((n) => n.id);
+        setSelectedIds(allIds);
+        setPrimaryId(allIds[0] || null);
+        return;
+      }
+
+      if (e.key === "delete" || e.key === "backspace") {
+        if (isEditingInput) return;
+        e.preventDefault();
+        deleteSelectedNode();
+        return;
+      }
+    };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        spacePressedRef.current = false;
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [nodes, edges, viewport, selectedIds, projectName, formatPainterActive]);
+
+  const worldStyle = {
+    transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
+    transformOrigin: "top left",
+  } as React.CSSProperties;
+
+  // client -> world 座標（用於拖曳連線 / 命中測試）
+  const clientToWorld = (clientX: number, clientY: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const x = (clientX - rect.left - viewport.x) / viewport.scale;
+    const y = (clientY - rect.top - viewport.y) / viewport.scale;
+    return { x, y };
+  };
+
+  // ---------- 多頁面操作 ----------
+  const handleAddPage = () => {
+    const id = createId();
+    const newPage: Page = {
+      id,
+      name: `Page ${pages.length + 1}`,
+      nodes: [],
+      edges: [],
+      viewport: { x: 0, y: 0, scale: 1 },
+    };
+    setPages((prev) => [...prev, newPage]);
+    setActivePageId(id);
+    // 切換到新頁面狀態
+    setNodes([]);
+    setEdges([]);
+    setViewport({ x: 0, y: 0, scale: 1 });
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const handleDuplicatePage = () => {
+    if (!activePageId) return;
+    const currentPage = pages.find((p) => p.id === activePageId);
+    if (!currentPage) return;
+    const id = createId();
+    const clone: Page = {
+      id,
+      name: `${currentPage.name} - copy`,
+      nodes: JSON.parse(JSON.stringify(nodes)),
+      edges: JSON.parse(JSON.stringify(edges)),
+      viewport: { ...viewport },
+    };
+    setPages((prev) => [...prev, clone]);
+    setActivePageId(id);
+    setNodes(clone.nodes);
+    setEdges(clone.edges);
+    setViewport(clone.viewport);
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const handleDeletePage = () => {
+    if (!activePageId) return;
+    if (pages.length <= 1) {
+      alert("至少要保留一個頁面");
+      return;
+    }
+    const idx = pages.findIndex((p) => p.id === activePageId);
+    if (idx === -1) return;
+    const sure = window.confirm("確定要刪除此頁面嗎？");
+    if (!sure) return;
+
+    const newPages = pages.filter((p) => p.id !== activePageId);
+    const newActive =
+      newPages[idx] || newPages[idx - 1] || newPages[0] || null;
+    setPages(newPages);
+    setActivePageId(newActive ? newActive.id : null);
+
+    if (newActive) {
+      setNodes(newActive.nodes || []);
+      setEdges(newActive.edges || []);
+      setViewport(newActive.viewport || { x: 0, y: 0, scale: 1 });
+    } else {
+      setNodes([]);
+      setEdges([]);
+      setViewport({ x: 0, y: 0, scale: 1 });
+    }
+
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const handleSwitchPage = (pageId: string) => {
+    if (pageId === activePageId) return;
+    const updatedPages: Page[] = pages.map((p) =>
+      p.id === activePageId
+        ? {
+            ...p,
+            nodes: JSON.parse(JSON.stringify(nodes)),
+            edges: JSON.parse(JSON.stringify(edges)),
+            viewport: { ...viewport },
+          }
+        : p
+    );
+    const target = updatedPages.find((p) => p.id === pageId);
+    setPages(updatedPages);
+    setActivePageId(pageId);
+    if (target) {
+      setNodes(target.nodes || []);
+      setEdges(target.edges || []);
+      setViewport(target.viewport || { x: 0, y: 0, scale: 1 });
+    }
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  };
+
+  const activePage = pages.find((p) => p.id === activePageId) || pages[0];
+
+  
+
+  // ---------- 左側 Outline 列表 ----------
+  const outlineItems = nodes
+    .slice()
+    .sort((a, b) => {
+      const la = a.level || "Info";
+      const lb = b.level || "Info";
+      if (la === lb) return (a.text || "").localeCompare(b.text || "");
+      const order: StrategyLevel[] = ["L1", "L2", "L3", "Info"];
+      return order.indexOf(la) - order.indexOf(lb);
+    });
+
+  return (
+    <div
+      className="flex h-screen w-full flex-col bg-slate-200 text-slate-900"
+      style={{ overscrollBehavior: "none" }}
+    >
+      {/* 頂部工具列 */}
+      <header className="border-b border-slate-300 bg-slate-50">
+        <div className="flex items-center justify-between px-3 py-2 text-[13px]">
+          <div className="flex items-center gap-3">
+            <span className="rounded bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white">
+              產業圖譜白板
+            </span>
+            <input
+              className="w-64 rounded border border-slate-300 px-2 py-1 text-[12px]"
+              value={projectName}
+              onChange={(e) => setProjectName(e.target.value)}
+              placeholder="輸入專案名稱，例如：AI 產業鏈策略圖"
+            />
+            <span className="text-[11px] text-slate-400">
+              檔名：{currentFileName || "(尚未儲存為 .lmwb)"}
+            </span>
+          </div>
+          <div className="flex items-center gap-1 text-[12px]">
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "file"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "file" ? "none" : "file"
+                )
+              }
+            >
+              File
+            </button>
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "view"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "view" ? "none" : "view"
+                )
+              }
+            >
+              View
+            </button>
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "insert"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "insert" ? "none" : "insert"
+                )
+              }
+            >
+              Insert
+            </button>
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "arrange"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "arrange" ? "none" : "arrange"
+                )
+              }
+            >
+              Arrange
+            </button>
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "strategy"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "strategy" ? "none" : "strategy"
+                )
+              }
+            >
+              Strategy
+            </button>
+            <button
+              className={`rounded px-2 py-1 ${
+                activeToolbar === "help"
+                  ? "bg-slate-800 text-white"
+                  : "bg-white text-slate-800 border border-slate-300"
+              }`}
+              onClick={() =>
+                setActiveToolbar((prev) =>
+                  prev === "help" ? "none" : "help"
+                )
+              }
+            >
+              Help
+            </button>
+          </div>
+        </div>
+
+        {/* 第二層工具內容 */}
+        {activeToolbar !== "none" && (
+          <div className="border-t border-slate-200 bg-slate-50 px-3 py-2 text-[12px]">
+            {activeToolbar === "file" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => {
+                    try {
+                      const pagesForSave: Page[] = pages.map((p) =>
+                        p.id === activePageId
+                          ? {
+                              ...p,
+                              nodes: JSON.parse(JSON.stringify(nodes)),
+                              edges: JSON.parse(JSON.stringify(edges)),
+                              viewport: { ...viewport },
+                            }
+                          : p
+                      );
+                      const data: ProjectFileV2 = {
+                        version: 2,
+                        projectName,
+                        activePageId,
+                        pages: pagesForSave,
+                      };
+                      window.localStorage.setItem(
+                        STORAGE_KEY,
+                        JSON.stringify(data)
+                      );
+                      alert("已儲存到瀏覽器（此電腦最近專案）");
+                    } catch {
+                      alert("儲存失敗（瀏覽器限制）");
+                    }
+                  }}
+                >
+                  Save to Browser
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => {
+                    try {
+                      const raw =
+                        window.localStorage.getItem(STORAGE_KEY);
+                      if (!raw) {
+                        alert("尚未有儲存的圖譜資料");
+                        return;
+                      }
+                      const parsed = JSON.parse(raw);
+                      if (parsed && Array.isArray(parsed.pages)) {
+                        const proj = parsed as ProjectFileV2;
+                        setProjectName(
+                          proj.projectName ||
+                            "industry-map-whiteboard"
+                        );
+                        setPages(proj.pages || []);
+                        const activeId =
+                          proj.activePageId ||
+                          proj.pages?.[0]?.id ||
+                          null;
+                        setActivePageId(activeId);
+                        const activePage =
+                          proj.pages?.find((p) => p.id === activeId) ||
+                          proj.pages?.[0];
+                        if (activePage) {
+                          setNodes(activePage.nodes || []);
+                          setEdges(activePage.edges || []);
+                          setViewport(
+                            activePage.viewport || {
+                              x: 0,
+                              y: 0,
+                              scale: 1,
+                            }
+                          );
+                        } else {
+                          setNodes([]);
+                          setEdges([]);
+                          setViewport({
+                            x: 0,
+                            y: 0,
+                            scale: 1,
+                          });
+                        }
+                        setSelectedIds([]);
+                        setPrimaryId(null);
+                        setEditingId(null);
+                        alert("已開啟最近專案（此電腦）");
+                      } else {
+                        alert("載入失敗（資料格式錯誤）");
+                      }
+                    } catch {
+                      alert("載入失敗（資料格式錯誤）");
+                    }
+                  }}
+                >
+                  Open from Browser
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={handleExportPng}
+                >
+                  Export PNG
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => handleExportLmwb(false)}
+                >
+                  Save (.lmwb)
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => handleExportLmwb(true)}
+                >
+                  Save As (.lmwb)
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => importFileRef.current?.click()}
+                >
+                  Import .lmwb / JSON
+                </button>
+                <input
+                  ref={importFileRef}
+                  type="file"
+                  accept=".lmwb,.json,application/json"
+                  className="hidden"
+                  onChange={handleImportChange}
+                />
+              </div>
+            )}
+
+            {activeToolbar === "view" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() =>
+                    setViewport((v) => ({
+                      ...v,
+                      scale: Math.min(3, v.scale * 1.2),
+                    }))
+                  }
+                >
+                  Zoom +
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() =>
+                    setViewport((v) => ({
+                      ...v,
+                      scale: Math.max(0.2, v.scale / 1.2),
+                    }))
+                  }
+                >
+                  Zoom -
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
+                >
+                  100%
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={handleFitToContent}
+                >
+                  Fit to Content
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <label className="flex items-center gap-1 text-[12px] text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={snapToGrid}
+                    onChange={(e) => setSnapToGrid(e.target.checked)}
+                  />
+                  Snap to Grid ({gridSize}px)
+                </label>
+                <span className="mx-1 text-slate-400">|</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => setShowLeftPanel((v) => !v)}
+                >
+                  {showLeftPanel ? "Hide Left Panel" : "Show Left Panel"}
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => setShowRightPanel((v) => !v)}
+                >
+                  {showRightPanel ? "Hide Right Panel" : "Show Right Panel"}
+                </button>
+              </div>
+            )}
+
+            {activeToolbar === "insert" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-slate-500">新增節點：</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => addNodeAtCenter("category")}
+                >
+                  分類節點
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => addNodeAtCenter("note")}
+                >
+                  便利貼
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => addNodeAtCenter("text")}
+                >
+                  文字
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => addNodeAtCenter("image")}
+                >
+                  圖片（拖曳 / 貼上）
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => addNodeAtCenter("table")}
+                >
+                  表格（預設 3×3）
+                </button>
+              </div>
+            )}
+
+            {activeToolbar === "arrange" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-slate-500">排列：</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("left")}
+                >
+                  左對齊
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("centerX")}
+                >
+                  水平置中
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("right")}
+                >
+                  右對齊
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("top")}
+                >
+                  上對齊
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("centerY")}
+                >
+                  垂直置中
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => alignSelected("bottom")}
+                >
+                  下對齊
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => distributeSelected("horizontal")}
+                >
+                  水平平均分佈
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => distributeSelected("vertical")}
+                >
+                  垂直平均分佈
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => matchSizeSelected("width")}
+                >
+                  同寬
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => matchSizeSelected("height")}
+                >
+                  同高
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => matchSizeSelected("both")}
+                >
+                  同寬高
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={createGroupForSelected}
+                  disabled={selectedIds.length < 2}
+                >
+                  建立群組
+                </button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={ungroupSelected}
+                >
+                  解散群組
+                </button>
+              </div>
+            )}
+
+            {activeToolbar === "strategy" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-slate-500">策略範本：</span>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => {
+                    recordHistory();
+                    setNodes(templateNodes);
+                    setEdges([]);
+                    setViewport({ x: 0, y: 0, scale: 1 });
+                    setSelectedIds([]);
+                    setPrimaryId(null);
+                    setEditingId(null);
+                  }}
+                >
+                  AI 產業鏈範本
+                </button>
+
+<button
+  className="rounded border border-slate-300 bg-white px-2 py-1"
+  onClick={() => {
+    recordHistory();
+    setNodes(droneTemplateNodes);
+    setEdges(droneTemplateEdges);
+    setViewport({ x: 0, y: 0, scale: 1 });
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  }}
+>
+  無人機產業圖譜範本
+</button>
+
+<button
+  className="rounded border border-slate-300 bg-white px-2 py-1"
+  onClick={() => {
+    recordHistory();
+    setNodes(robotTemplateNodes);
+    setEdges(robotTemplateEdges);
+    setViewport({ x: 0, y: 0, scale: 0.95 });
+    setSelectedIds([]);
+    setPrimaryId(null);
+    setEditingId(null);
+  }}
+>
+  機器人產業圖譜範本
+</button>
+                <button
+                  className="rounded border border-slate-300 bg-white px-2 py-1"
+                  onClick={() => {
+                    recordHistory();
+                    setNodes([]);
+                    setEdges([]);
+                    setViewport({ x: 0, y: 0, scale: 1 });
+                    setSelectedIds([]);
+                    setPrimaryId(null);
+                    setEditingId(null);
+                  }}
+                >
+                  空白策略畫布
+                </button>
+                <span className="mx-1 text-slate-400">|</span>
+                <span className="text-slate-500">
+                  之後可加入 SWOT / Roadmap / 商務模式 Canvas…
+                </span>
+              </div>
+            )}
+
+            {activeToolbar === "help" && (
+              <div className="space-y-1 text-[12px] text-slate-600">
+                <div>● 滑鼠左鍵拖曳空白區域：矩形框選節點</div>
+                <div>● 按住 Space 或中鍵拖曳：平移畫面</div>
+                <div>● Ctrl/⌘ + C / V：複製 / 貼上節點</div>
+                <div>● Ctrl/⌘ + Z / Shift+Z / Y：Undo / Redo</div>
+                <div>● 拖曳圖片檔或從剪貼簿貼上：建立圖片節點</div>
+                <div>● 右側屬性面板可設定策略層級 / 類別 / Impact / Effort</div>
+              </div>
+            )}
+          </div>
+        )}
+      </header>
+
+      {/* 主體區域：左側面板 + 畫布 + 右側屬性 */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* 左側：專案 / 範本 / 大綱 */}
+        {showLeftPanel && (
+          <aside className="flex w-80 shrink-0 flex-col border-r border-slate-300 bg-white px-3 py-3 text-[13px]">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-sm font-semibold">專案與頁面</div>
+              <div className="text-[11px] text-slate-500">
+                節點：{nodes.length}　選取：{selectedIds.length}
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <div className="mb-2 flex gap-1 text-[12px]">
+              <button
+                className={`flex-1 rounded px-2 py-1 ${
+                  leftTab === "project"
+                    ? "bg-slate-900 text-white"
+                    : "bg-slate-100 text-slate-700"
+                }`}
+                onClick={() => setLeftTab("project")}
+              >
+                Project
+              </button>
+              <button
+                className={`flex-1 rounded px-2 py-1 ${
+                  leftTab === "templates"
+                    ? "bg-slate-900 text-white"
+                    : "bg-slate-100 text-slate-700"
+                }`}
+                onClick={() => setLeftTab("templates")}
+              >
+                Templates
+              </button>
+              <button
+                className={`flex-1 rounded px-2 py-1 ${
+                  leftTab === "outline"
+                    ? "bg-slate-900 text-white"
+                    : "bg-slate-100 text-slate-700"
+                }`}
+                onClick={() => setLeftTab("outline")}
+              >
+                Outline
+              </button>
+            </div>
+
+            {/* Tab 內容 */}
+            {leftTab === "project" && (
+              <div className="flex-1 space-y-3 overflow-auto pr-1">
+                <div>
+                  <div className="mb-1 text-xs text-slate-500">
+                    專案名稱
+                  </div>
+                  <input
+                    className="w-full rounded border border-slate-300 px-2 py-1 text-[12px]"
+                    value={projectName}
+                    onChange={(e) => setProjectName(e.target.value)}
+                    placeholder="輸入專案名稱"
+                  />
+                </div>
+
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-xs text-slate-500">
+                    <span>頁面列表</span>
+                    <span className="text-[10px] text-slate-400">
+                      點選切換 / 右鍵可重新命名
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {pages.map((p) => (
+                      <button
+                        key={p.id}
+                        className={`flex w-full items-center justify-between rounded border px-2 py-1 text-left text-[12px] ${
+                          p.id === activePageId
+                            ? "border-blue-500 bg-blue-50 text-blue-700"
+                            : "border-slate-200 bg-white text-slate-800"
+                        }`}
+                        onClick={() => handleSwitchPage(p.id)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          const name = window.prompt(
+                            "重新命名頁面：",
+                            p.name
+                          );
+                          if (name && name.trim()) {
+                            setPages((prev) =>
+                              prev.map((pp) =>
+                                pp.id === p.id
+                                  ? { ...pp, name: name.trim() }
+                                  : pp
+                              )
+                            );
+                          }
+                        }}
+                      >
+                        <span className="truncate">{p.name}</span>
+                        <span className="ml-2 text-[10px] text-slate-400">
+                          {p.nodes.length} nodes
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-2 flex gap-1 text-[12px]">
+                    <button
+                      className="flex-1 rounded border border-slate-300 bg-white px-2 py-1"
+                      onClick={handleAddPage}
+                    >
+                      新增頁面
+                    </button>
+                    <button
+                      className="flex-1 rounded border border-slate-300 bg-white px-2 py-1"
+                      onClick={handleDuplicatePage}
+                    >
+                      複製頁面
+                    </button>
+                    <button
+                      className="flex-1 rounded border border-red-300 bg-red-50 px-2 py-1 text-red-700"
+                      onClick={handleDeletePage}
+                    >
+                      刪除頁面
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-1 text-xs text-slate-500">
+                    工具模式
+                  </div>
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <button
+                      className={`h-8 flex-1 rounded border ${
+                        tool === "select"
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "border-slate-300 bg-white"
+                      }`}
+                      onClick={() => handleToolClick("select")}
+                    >
+                      選取 / 多選
+                    </button>
+                    <button
+                      className={`h-8 flex-1 rounded border ${
+                        tool === "pan"
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "border-slate-300 bg-white"
+                      }`}
+                      onClick={() => handleToolClick("pan")}
+                    >
+                      平移 (Space/中鍵)
+                    </button>
+                    <button
+                      className={`h-8 flex-1 rounded border ${
+                        tool === "connect"
+                          ? "border-blue-500 bg-blue-50 text-blue-700"
+                          : "border-slate-300 bg-white"
+                      }`}
+                      onClick={() => handleToolClick("connect")}
+                    >
+                      連線
+                    </button>
+                    <button
+                      className={`h-8 flex-1 rounded border ${
+                       tool === "pen"
+                       ? "border-blue-500 bg-blue-50 text-blue-700"
+                       : "border-slate-300 bg-white"
+                      }`}
+                      onClick={() => handleToolClick("pen")}
+                      >
+                     畫筆 Pen
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-1 text-xs text-slate-500">
+                    Undo / Redo / Copy
+                  </div>
+                  <div className="flex flex-col gap-1 text-xs">
+                    <button
+                      className="h-8 rounded border border-slate-300 bg-white"
+                      onClick={handleUndo}
+                    >
+                      Undo (Ctrl/Cmd + Z)
+                    </button>
+                    <button
+                      className="h-8 rounded border border-slate-300 bg-white"
+                      onClick={handleRedo}
+                    >
+                      Redo (Ctrl/Cmd + Y / Shift+Z)
+                    </button>
+                    <button
+                      className="h-8 rounded border border-slate-300 bg-white"
+                      onClick={copySelectedNode}
+                    >
+                      複製 (Ctrl/Cmd + C)
+                    </button>
+                    <button
+                      className="h-8 rounded border border-slate-300 bg-white"
+                      onClick={pasteNodeFromClipboard}
+                    >
+                      貼上 (Ctrl/Cmd + V)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {leftTab === "templates" && (
+              <div className="flex-1 space-y-3 overflow-auto pr-1 text-[12px]">
+                <div className="text-xs text-slate-500">
+                  策略範本（點選插入到目前頁面）：
+                </div>
+                <button
+                  className="w-full rounded border border-slate-300 bg-white px-2 py-2 text-left hover:bg-slate-50"
+                  onClick={() => {
+                    recordHistory();
+                    setNodes(templateNodes);
+                    setEdges([]);
+                    setViewport({ x: 0, y: 0, scale: 1 });
+                    setSelectedIds([]);
+                    setPrimaryId(null);
+                    setEditingId(null);
+                  }}
+                >
+                  <div className="font-semibold">AI 產業鏈範本</div>
+                  <div className="text-[11px] text-slate-500">
+                    AI / Edge / 雲端 / 應用 / Connectivity 初始結構
+                  </div>
+                </button>
+                <button
+                  className="w-full rounded border border-slate-300 bg-white px-2 py-2 text-left hover:bg-slate-50"
+                  onClick={() => {
+                    recordHistory();
+                    setNodes([]);
+                    setEdges([]);
+                    setViewport({ x: 0, y: 0, scale: 1 });
+                    setSelectedIds([]);
+                    setPrimaryId(null);
+                    setEditingId(null);
+                  }}
+                >
+                  <div className="font-semibold">空白策略畫布</div>
+                  <div className="text-[11px] text-slate-500">
+                    清空所有節點與連線，重頭開始規劃
+                  </div>
+                </button>
+                <div className="mt-2 text-[11px] text-slate-400">
+                  未來可以加入：
+                  <br />
+                  ・SWOT / 5 Forces / Business Model Canvas 範本
+                  <br />
+                  ・Pricing / Roadmap / Connectivity 供應鏈模板
+                </div>
+              </div>
+            )}
+
+            {leftTab === "outline" && (
+              <div className="flex-1 overflow-auto pr-1 text-[12px]">
+                {outlineItems.length === 0 ? (
+                  <div className="text-[12px] text-slate-500">
+                    暫無任何節點。
+                    <br />
+                    可先在 Insert / Templates 中建立基本結構。
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    {outlineItems.map((n) => (
+                      <button
+                        key={n.id}
+                        className={`flex w-full items-center justify-between rounded px-2 py-1 text-left text-[12px] ${
+                          selectedIds.includes(n.id)
+                            ? "bg-blue-50 text-blue-700"
+                            : "hover:bg-slate-100"
+                        }`}
+                        onClick={() => {
+                          setSelectedIds([n.id]);
+                          setPrimaryId(n.id);
+                          setEditingId(null);
+                          // 簡易 focus：把目標移到畫面中央
+                          if (containerRef.current) {
+                            const rect =
+                              containerRef.current.getBoundingClientRect();
+                            const centerX = n.x + n.width / 2;
+                            const centerY = n.y + n.height / 2;
+                            const newScale = viewport.scale;
+                            const x =
+                              rect.width / 2 - centerX * newScale;
+                            const y =
+                              rect.height / 2 - centerY * newScale;
+                            setViewport({ x, y, scale: newScale });
+                          }
+                        }}
+                      >
+                        <div className="flex flex-col">
+                          <span className="truncate">
+                            [{n.level || "Info"}] {n.text || "(無標題)"}
+                          </span>
+                          <span className="text-[10px] text-slate-400">
+                            {n.categoryTag || "未分類"}｜(
+                            {Math.round(n.x)}, {Math.round(n.y)})
+                          </span>
+                        </div>
+                        <span className="ml-2 text-[10px] text-slate-400">
+                          {n.type}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </aside>
+        )}
+
+        {/* 中間畫布 */}
+        <div
+          ref={containerRef}
+          className="relative flex flex-1 overflow-hidden bg-slate-100"
+          onMouseDown={handleCanvasMouseDown}
+          onMouseMove={handleCanvasMouseMove}
+          onMouseUp={handleCanvasMouseUp}
+          onMouseLeave={handleCanvasMouseUp}
+          onWheel={handleWheel}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+        >
+          <div
+            ref={canvasRef}
+            className="absolute left-0 top-0 h-[4000px] w-[4000px]"
+            style={worldStyle}
+          >
+            <GridBackground />
+            <EdgeLayer nodes={nodes} edges={edges} connectingFrom={connectingFrom} connectingTo={connectingTo} />
+
+            {/* 智慧對齊線 */}
+            {guideLines.v !== undefined && (
+              <div
+                className="pointer-events-none absolute top-0 h-full w-px bg-purple-400"
+                style={{
+                  left:
+                    guideLines.v * viewport.scale + viewport.x,
+                }}
+              />
+            )}
+            {guideLines.h !== undefined && (
+              <div
+                className="pointer-events-none absolute left-0 w-full border-t border-purple-400"
+                style={{
+                  top: guideLines.h * viewport.scale + viewport.y,
+                }}
+              />
+            )}
+
+            {/* 節點 */}
+            {nodes.map((node) => (
+              <WhiteboardNode
+                key={node.id}
+                node={node}
+                selected={selectedIds.includes(node.id)}
+                currentTool={tool}
+                isEditing={editingId === node.id}
+                onMouseDown={handleNodeMouseDown}
+                onResizeHandleMouseDown={
+                  handleResizeHandleMouseDown
+                }
+                onDoubleClick={handleDoubleClickNode}
+                onInlineTextChange={handleInlineTextChange}
+                onFinishEditing={handleFinishEditing}
+                onTableCellChange={handleTableCellChange}
+              />
+            ))}
+          </div>
+
+          {/* 矩形框選視覺 */}
+          {selectionRect && (
+            <div
+              className="pointer-events-none absolute border border-blue-400 bg-blue-200/20"
+              style={{
+                left: Math.min(selectionRect.x1, selectionRect.x2),
+                top: Math.min(selectionRect.y1, selectionRect.y2),
+                width: Math.abs(selectionRect.x2 - selectionRect.x1),
+                height: Math.abs(selectionRect.y2 - selectionRect.y1),
+              }}
+            />
+          )}
+
+          {/* Mini-map + Zoom 顯示 */}
+          <MiniMap
+            nodes={nodes}
+             viewport={viewport}
+            containerRef={containerRef}
+          />
+        </div>
+
+        {/* 右側屬性面板 */}
+        {showRightPanel && (
+          <aside className="flex w-80 shrink-0 flex-col border-l border-slate-300 bg-white px-3 py-3 text-[13px]">
+            <div className="mb-2 text-base font-semibold">
+              屬性 / 策略資訊
+            </div>
+
+            {!selectedNode ? (
+              <div className="text-[12px] text-slate-500">
+                尚未選取節點。
+                <br />
+                ● 拖曳空白處可框選多個節點
+                <br />
+                ● Shift / Ctrl + 點擊 可多選/取消選取
+                <br />
+                ● Ctrl/Alt 拖曳 可快速複製節點
+              </div>
+            ) : (
+              <div className="flex-1 space-y-3 overflow-auto pr-1 text-[12px]">
+                {/* 基本資訊 + 刪除 */}
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-semibold">
+                      ID: {selectedNode.id}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      類型：{selectedNode.type}　群組：
+                      {selectedNode.groupId || "無"}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      已選取 {selectedIds.length} 個節點
+                    </div>
+                  </div>
+                  <button
+                    className="rounded border border-red-300 bg-red-50 px-2 py-1 text-[11px] text-red-700"
+                    onClick={deleteSelectedNode}
+                  >
+                    刪除
+                  </button>
+                </div>
+
+                {/* Format Painter */}
+                <div className="flex items-center justify-between">
+                  <button
+                    className={`rounded border px-2 py-1 text-[11px] ${
+                      formatPainterActive
+                        ? "border-orange-500 bg-orange-50 text-orange-700"
+                        : "border-slate-300 bg-white"
+                    }`}
+                    onClick={() => {
+                      if (formatPainterActive) {
+                        setFormatPainterActive(false);
+                        formatSourceIdRef.current = null;
+                      } else if (selectedNode) {
+                        formatSourceIdRef.current = selectedNode.id;
+                        setFormatPainterActive(true);
+                      }
+                    }}
+                  >
+                    複製格式 (Format Painter)
+                  </button>
+                  {formatPainterActive && (
+                    <span className="text-[10px] text-slate-500">
+                      點其他節點套用格式，按此按鈕或 Esc 關閉
+                    </span>
+                  )}
+                </div>
+
+                {/* 群組 / 鎖定 */}
+                <div className="space-y-1">
+                  <div className="text-xs text-slate-500">
+                    群組 / 鎖定
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    <button
+                      className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+                      disabled={selectedIds.length < 2}
+                      onClick={createGroupForSelected}
+                    >
+                      建立群組
+                    </button>
+                    <button
+                      className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+                      onClick={ungroupSelected}
+                    >
+                      解散群組
+                    </button>
+                    <label className="flex items-center gap-1 text-[11px] text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={!!selectedNode.locked}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            locked: e.target.checked,
+                          })
+                        }
+                      />
+                      鎖定位置
+                    </label>
+                  </div>
+                </div>
+
+                {/* 文字內容 */}
+                {(selectedNode.type === "category" ||
+                  selectedNode.type === "note" ||
+                  selectedNode.type === "text") && (
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      文字內容
+                    </div>
+                    <textarea
+                      className="h-24 w-full resize-none rounded border border-slate-300 p-2 text-[12px] leading-snug outline-none"
+                      value={selectedNode.text || ""}
+                      onChange={(e) =>
+                        updateSelectedNode({ text: e.target.value })
+                      }
+                    />
+                  </div>
+                )}
+
+                {/* 圖片 URL */}
+                {selectedNode.type === "image" && (
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      圖片 URL 或 dataURL
+                    </div>
+                    <input
+                      className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                      value={selectedNode.imageUrl || ""}
+                      onChange={(e) =>
+                        updateSelectedNode({
+                          imageUrl: e.target.value || undefined,
+                        })
+                      }
+                    />
+                    <div className="mt-1 text-[11px] text-slate-400">
+                      由剪貼簿/拖曳貼上的圖片已自動轉為 dataURL，
+                      並會打包進 .lmwb。
+</div>
+
+<div className="mt-2 flex flex-wrap gap-2">
+  <button
+    className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+    onClick={openCropModalForSelected}
+    disabled={!selectedNode.imageUrl || !!selectedNode.locked}
+    title={
+      selectedNode.locked
+        ? "已鎖定，無法裁切"
+        : !selectedNode.imageUrl
+        ? "沒有圖片 URL"
+        : "裁切圖片"
+    }
+  >
+    裁切 Crop…
+  </button>
+  <button
+    className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px]"
+    onClick={resetCropForSelected}
+    disabled={!selectedNode.imageCrop}
+    title="清除裁切"
+  >
+    重設裁切
+  </button>
+  {selectedNode.imageCrop && (
+    <span className="self-center text-[11px] text-slate-500">
+      已裁切
+    </span>
+  )}
+</div>
+                  </div>
+                )}
+
+                {/* 位置與尺寸 */}
+                <div>
+                  <div className="mb-1 text-xs text-slate-500">
+                    位置 / 尺寸
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        X
+                      </div>
+                      <input
+                        type="number"
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.x}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            x:
+                              Number(e.target.value) ||
+                              selectedNode.x,
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        Y
+                      </div>
+                      <input
+                        type="number"
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.y}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            y:
+                              Number(e.target.value) ||
+                              selectedNode.y,
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        寬度
+                      </div>
+                      <input
+                        type="number"
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.width}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            width:
+                              Number(e.target.value) ||
+                              selectedNode.width,
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        高度
+                      </div>
+                      <input
+                        type="number"
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.height}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            height:
+                              Number(e.target.value) ||
+                              selectedNode.height,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* 字體大小（包含 table） */}
+                {selectedNode.type !== "image" && (
+                  <div>
+                    <div className="mb-1 text-xs text-slate-500">
+                      文字大小 (px)
+                    </div>
+                    <input
+                      type="number"
+                      min={8}
+                      max={48}
+                      className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                      value={selectedNode.fontSize ?? 12}
+                      onChange={(e) =>
+                        updateSelectedNode({
+                          fontSize: Number(e.target.value) || 12,
+                        })
+                      }
+                    />
+                  </div>
+                )}
+
+                {/* 背景顏色 */}
+                <div>
+                  <div className="mb-1 text-xs text-slate-500">
+                    背景顏色 (Hex)
+                  </div>
+                  <input
+                    className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                    value={selectedNode.bgColor || ""}
+                    onChange={(e) =>
+                      updateSelectedNode({
+                        bgColor: e.target.value || undefined,
+                      })
+                    }
+                    placeholder="#ffffff"
+                  />
+                </div>
+
+                {/* 表格行列 */}
+                {selectedNode.type === "table" &&
+                  selectedNode.table && (
+                    <div>
+                      <div className="mb-1 text-xs text-slate-500">
+                        表格行數 / 列數
+                      </div>
+                      <div className="flex gap-2">
+                        <div className="flex-1">
+                          <div className="mb-0.5 text-[11px] text-slate-500">
+                            行數 (rows)
+                          </div>
+                          <input
+                            type="number"
+                            min={1}
+                            max={50}
+                            className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                            value={selectedNode.table.rows}
+                            onChange={(e) =>
+                              updateTableSize(
+                                selectedNode.id,
+                                Number(e.target.value) || 1,
+                                selectedNode.table!.cols
+                              )
+                            }
+                          />
+                        </div>
+                        <div className="flex-1">
+                          <div className="mb-0.5 text-[11px] text-slate-500">
+                            列數 (cols)
+                          </div>
+                          <input
+                            type="number"
+                            min={1}
+                            max={50}
+                            className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                            value={selectedNode.table.cols}
+                            onChange={(e) =>
+                              updateTableSize(
+                                selectedNode.id,
+                                selectedNode.table!.rows,
+                                Number(e.target.value) || 1
+                              )
+                            }
+                          />
+                        </div>
+                      </div>
+                      <div className="mt-1 text-[11px] text-slate-400">
+                        變更行列時會盡量保留原有文字，新格子會是空白。
+                      </div>
+                    </div>
+                  )}
+
+                {/* 策略欄位 */}
+                <div className="border-t border-slate-200 pt-2">
+                  <div className="mb-1 text-xs text-slate-500">
+                    策略屬性
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        層級 Level
+                      </div>
+                      <select
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.level || "Info"}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            level: e.target.value as StrategyLevel,
+                          })
+                        }
+                      >
+                        <option value="L1">L1 主策略</option>
+                        <option value="L2">L2 子策略</option>
+                        <option value="L3">L3 執行項</option>
+                        <option value="Info">Info 資訊</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        類別 Category
+                      </div>
+                      <input
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        placeholder="市場 / 技術 / 營運…"
+                        value={selectedNode.categoryTag || ""}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            categoryTag: e.target.value || undefined,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        Impact (1–5)
+                      </div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5}
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.impact ?? ""}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            impact:
+                              e.target.value === ""
+                                ? undefined
+                                : Math.max(
+                                    1,
+                                    Math.min(5, Number(e.target.value))
+                                  ),
+                          })
+                        }
+                      />
+                    </div>
+                    <div>
+                      <div className="mb-0.5 text-[11px] text-slate-500">
+                        Effort (1–5)
+                      </div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5}
+                        className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                        value={selectedNode.effort ?? ""}
+                        onChange={(e) =>
+                          updateSelectedNode({
+                            effort:
+                              e.target.value === ""
+                                ? undefined
+                                : Math.max(
+                                    1,
+                                    Math.min(5, Number(e.target.value))
+                                  ),
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-2">
+                    <div className="mb-0.5 text-[11px] text-slate-500">
+                      Owner / 負責人
+                    </div>
+                    <input
+                      className="w-full rounded border border-slate-300 p-1 text-[12px]"
+                      placeholder="例如：Sales / FAE / RD"
+                      value={selectedNode.owner || ""}
+                      onChange={(e) =>
+                        updateSelectedNode({
+                          owner: e.target.value || undefined,
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+
+                {/* 多選排列提示 */}
+                {selectedIds.length >= 2 && (
+                  <div className="border-t border-slate-200 pt-2 text-[11px] text-slate-500">
+                    多選排列工具可在上方 Arrange 工具列中使用。
+                  </div>
+                )}
+              </div>
+            )}
+          </aside>
+        )}
+
+{/* ---------- Crop Modal ---------- */}
+{cropModalOpen && cropTargetId && (
+  <div
+    className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
+    onMouseDown={(e) => {
+      // 點遮罩不關閉，避免誤觸；按右上角 X 或取消
+      e.stopPropagation();
+    }}
+  >
+    <div className="w-full max-w-3xl rounded-xl bg-white p-4 shadow-xl">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="text-sm font-semibold text-slate-800">
+          圖片裁切 Crop
+        </div>
+        <button
+          className="rounded border border-slate-300 bg-white px-2 py-1 text-xs"
+          onClick={closeCropModal}
+        >
+          ✕
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <div className="rounded border border-slate-200 p-2">
+          <div className="mb-2 text-[11px] text-slate-500">
+            拖曳建立裁切框；拖曳框可移動
+          </div>
+          <div
+            ref={cropImgBoxRef}
+            className="relative aspect-video w-full overflow-hidden rounded bg-slate-100"
+            onMouseDown={onCropMouseDown}
+            onMouseMove={onCropMouseMove}
+            onMouseUp={onCropMouseUp}
+            onMouseLeave={onCropMouseUp}
+          >
+            <img
+              src={
+                nodes.find((n) => n.id === cropTargetId)?.imageUrl || ""
+              }
+              alt="crop"
+              draggable={false}
+              onDragStart={(e) => e.preventDefault()}
+              className="h-full w-full select-none object-contain pointer-events-none"
+            />
+
+            {/* 遮罩 */}
+            {draftCrop && (
+              <>
+                <div className="absolute inset-0 bg-black/30" />
+                <div
+                  className="absolute border-2 border-blue-500 bg-blue-300/10"
+                  style={{
+                    left: `${draftCrop.x * 100}%`,
+                    top: `${draftCrop.y * 100}%`,
+                    width: `${draftCrop.w * 100}%`,
+                    height: `${draftCrop.h * 100}%`,
+                  }}
+                />
+                {/* 把裁切框外的遮罩挖掉：用四塊 */}
+                <div
+                  className="absolute bg-black/30"
+                  style={{
+                    left: 0,
+                    top: 0,
+                    width: "100%",
+                    height: `${draftCrop.y * 100}%`,
+                  }}
+                />
+                <div
+                  className="absolute bg-black/30"
+                  style={{
+                    left: 0,
+                    top: `${(draftCrop.y + draftCrop.h) * 100}%`,
+                    width: "100%",
+                    height: `${(1 - (draftCrop.y + draftCrop.h)) * 100}%`,
+                  }}
+                />
+                <div
+                  className="absolute bg-black/30"
+                  style={{
+                    left: 0,
+                    top: `${draftCrop.y * 100}%`,
+                    width: `${draftCrop.x * 100}%`,
+                    height: `${draftCrop.h * 100}%`,
+                  }}
+                />
+                <div
+                  className="absolute bg-black/30"
+                  style={{
+                    left: `${(draftCrop.x + draftCrop.w) * 100}%`,
+                    top: `${draftCrop.y * 100}%`,
+                    width: `${(1 - (draftCrop.x + draftCrop.w)) * 100}%`,
+                    height: `${draftCrop.h * 100}%`,
+                  }}
+                />
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded border border-slate-200 p-2">
+          <div className="mb-2 text-[11px] text-slate-500">預覽</div>
+          <div className="aspect-video w-full overflow-hidden rounded bg-slate-100">
+            <div className="h-full w-full">
+              {/* 直接用節點本身渲染（套用 draft crop） */}
+              <div className="relative h-full w-full">
+                <img
+                  src={
+                    nodes.find((n) => n.id === cropTargetId)?.imageUrl || ""
+                  }
+                  alt="preview"
+                  draggable={false}
+                  onDragStart={(e) => e.preventDefault()}
+                  className="h-full w-full select-none pointer-events-none"
+                  style={{
+                    objectFit: draftCrop ? "cover" : "contain",
+                    transformOrigin: "top left",
+                    transform: draftCrop
+                      ? `translate(${-draftCrop.x * 100}%, ${-draftCrop.y * 100}%) scale(${1 / Math.max(1e-6, draftCrop.w)}, ${1 / Math.max(1e-6, draftCrop.h)})`
+                      : undefined,
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              className="rounded border border-slate-300 bg-white px-3 py-1 text-[12px]"
+              onClick={() => setDraftCrop({ x: 0, y: 0, w: 1, h: 1 })}
+            >
+              全圖
+            </button>
+            <button
+              className="rounded border border-slate-300 bg-white px-3 py-1 text-[12px]"
+              onClick={() => setDraftCrop({ x: 0.1, y: 0.1, w: 0.8, h: 0.8 })}
+            >
+              置中 80%
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button
+          className="rounded border border-slate-300 bg-white px-3 py-1 text-sm"
+          onClick={closeCropModal}
+        >
+          取消
+        </button>
+        <button
+          className="rounded bg-blue-600 px-3 py-1 text-sm text-white"
+          onClick={applyDraftCrop}
+        >
+          套用
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+      </div>
+    </div>
+  );
+}
