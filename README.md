@@ -1,4 +1,4 @@
-# InduMap - 產業圖譜白板
+# FlowCanvas - Infinite Canvas for Strategy Flows
 
 一個功能豐富的互動式白板應用，具備 AI 驅動的產業圖譜生成、分析和優化能力。支持網頁版和 Windows 桌面應用。
 
